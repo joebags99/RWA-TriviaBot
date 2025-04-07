@@ -69,7 +69,7 @@ intents.message_content = True
 intents.members = True
 intents.reactions = True  # Need this for reaction roles
 
-bot = commands.Bot(command_prefix="?", intents=intents, description=BOT_DESCRIPTION)
+bot = commands.Bot(command_prefix="?", intents=intents, description=BOT_DESCRIPTION, help_command=None)
 
 # ------------------------------------------------------------
 # 3) DATABASE HELPER FUNCTIONS
@@ -576,11 +576,9 @@ async def import_mappings(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error processing the file: {str(e)}")
 
-@bot.command(name="helpme")
+@bot.command(name="help")
 async def custom_help(ctx):
-    """
-    A custom help command that lists all commands and usage.
-    """
+    """A custom help command that lists all commands and usage."""
     embed = discord.Embed(
         title="Royal Scribe Commands",
         description="Here are the commands available in this server:",
@@ -590,52 +588,44 @@ async def custom_help(ctx):
     # User commands
     user_commands = """
 **?leaderboard**
-• Shows the current leaderboard.
-• Everyone can use this.
+- Shows the current leaderboard.
 
 **?total_leaderboard**
-• Shows the all-time leaderboard.
-• Everyone can use this.
+- Shows the all-time leaderboard.
 
 **?whoami**
-• Shows which Twitch username is linked to your Discord account.
-• Everyone can use this.
+- Shows which Twitch username is linked to your Discord account.
 
 **?member_count**
-• Shows how many members the bot can see.
-• Everyone can use this.
-
-**?helpme**
-• Displays this help message.
-• Everyone can use this.
+- Shows how many members the bot can see.
 """
     embed.add_field(name="User Commands", value=user_commands, inline=False)
     
     # Admin commands
     admin_commands = """
 **?link_twitch @User TwitchUsername**
-• Links a Discord user to a Twitch username.
-• Admin-only: requires Roll With Advantage! role.
+- Links a Discord user to a Twitch username.
+- Admin-only: requires Roll With Advantage! role.
 
 **?update_roles**
-• Manually updates the champion roles.
-• Admin-only: requires Roll With Advantage! role.
+- Manually updates the champion roles.
+- Admin-only: requires Roll With Advantage! role.
 
 **?create_reaction_role Message Emoji @Role**
-• Creates a new reaction role.
-• Admin-only: requires Roll With Advantage! role.
+- Creates a new reaction role.
+- Admin-only: requires Roll With Advantage! role.
 
 **?create_role_message Title**
-• Creates a reaction role message with pre-defined roles.
-• Admin-only: requires Roll With Advantage! role.
+- Creates a reaction role message with pre-defined roles.
+- Admin-only: requires Roll With Advantage! role.
 
 **?export_mappings**
-• Exports all Twitch-Discord user mappings to a CSV file.
-• Admin-only: requires Roll With Advantage! role.
+- Exports all Twitch-Discord user mappings to a CSV file.
+- Admin-only: requires Roll With Advantage! role.
 
 **?import_mappings**
-• Imports Twitch-Discord mappings from an attached CSV file.
-• Admin-only: requires Roll With Advantage! role.
+- Imports Twitch-Discord mappings from an attached CSV file.
+- Admin-only: requires Roll With Advantage! role.
 """
     embed.add_field(name="Admin Commands", value=admin_commands, inline=False)
     
