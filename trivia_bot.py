@@ -795,12 +795,12 @@ async def create_role_message(ctx, *, title="React to get roles!"):
         else:
             await ctx.send(f"⚠️ Warning: Role '{REACTION_ROLES[emoji]}' not found in server.")
     
-    success_embed = discord.Embed(
-        title="Success",
-        description="Reaction role message created successfully!",
-        color=discord.Color.green()
-    )
-    await ctx.send(embed=success_embed)
+        success_embed = discord.Embed(
+            title="✅ Role Message Created",
+            description="The reaction role menu has been set up successfully!",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=success_embed, delete_after=5.0)  # Auto-delete after 5 seconds
 
 @bot.event
 async def on_raw_reaction_add(payload):
