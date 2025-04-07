@@ -15,16 +15,17 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure logging
+# Configure logging - fixed log file name to be consistent
+LOG_FILE = "trivia_bot.log"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("royal_scribe.log"),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("royal_scribe")
+logger = logging.getLogger("trivia_bot")
 
 # ------------------------------------------------------------
 # 1) CONFIGURATION - SET THESE VALUES FOR YOUR SETUP
@@ -42,7 +43,6 @@ REACTION_ROLE_CHANNEL_ID = int(os.getenv("REACTION_ROLE_CHANNEL_ID", "0"))  # Re
 
 # File backup for scores (in case DB is down)
 SCORES_FILE = r"/home/ec2-user/RWA-TriviaBot/trivia_scores.csv"
-
 
 # MySQL Database Configuration
 DB_HOST = os.getenv("DB_HOST")
@@ -71,181 +71,173 @@ intents.reactions = True  # Need this for reaction roles
 
 bot = commands.Bot(command_prefix="?", intents=intents, description=BOT_DESCRIPTION, help_command=None)
 
+# Database connection cache
+db_connection = None
+
 # ------------------------------------------------------------
 # 3) DATABASE HELPER FUNCTIONS
 # ------------------------------------------------------------
 def get_db_connection():
-    """Creates a connection to the MySQL database."""
+    """Creates a connection to the MySQL database with connection pooling."""
+    global db_connection
+    
     try:
-        connection = pymysql.connect(
+        # Check if existing connection is valid
+        if db_connection is not None:
+            try:
+                db_connection.ping(reconnect=True)
+                return db_connection
+            except:
+                # If ping fails, connection is dead, so we'll create a new one
+                pass
+        
+        # Create new connection
+        db_connection = pymysql.connect(
             host=DB_HOST,
             user=DB_USER,
             password=DB_PASSWORD,
             database=DB_NAME,
             charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=False,  # We'll manage transactions manually
         )
-        return connection
+        return db_connection
     except Exception as e:
         logger.error(f"Database connection error: {e}")
         return None
 
-def create_tables_if_not_exist():
-    """Creates the necessary database tables if they don't exist."""
-    connection = get_db_connection()
-    if not connection:
-        logger.error("Failed to create tables - no database connection")
-        return False
-    
-    try:
-        with connection.cursor() as cursor:
-            # Create user mapping table for Twitch to Discord
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_mapping (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                twitch_username VARCHAR(255) NOT NULL,
-                discord_id VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY twitch_username (twitch_username)
-            )
-            """)
-            
-            # Create reaction roles table
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reaction_roles (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                message_id VARCHAR(255) NOT NULL,
-                emoji VARCHAR(255) NOT NULL,
-                role_id VARCHAR(255) NOT NULL,
-                UNIQUE KEY message_emoji (message_id, emoji)
-            )
-            """)
-            
-        connection.commit()
-        logger.info("Database tables created successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Error creating tables: {e}")
-        return False
-    finally:
-        connection.close()
-
-def get_scores_from_external_db():
-    """Gets scores from the external database."""
+def execute_db_query(query, params=None, fetch=True, commit=True):
+    """Execute a database query with proper error handling and connection management."""
     connection = get_db_connection()
     if not connection:
         logger.error("Failed to connect to database")
-        return pd.DataFrame()
+        return None
     
+    result = None
     try:
         with connection.cursor() as cursor:
-            # Updated to match your exact table and column names
-            cursor.execute("""
-            SELECT 
-                user_id as id, 
-                score AS Score, 
-                lastUpdated AS RecentDate,
-                createdAt AS FirstDate,
-                username AS Username
-            FROM user_scores
-            WHERE username IS NOT NULL
-            """)
-            results = cursor.fetchall()
+            cursor.execute(query, params)
             
-        if not results:
-            return pd.DataFrame()
+            if fetch:
+                result = cursor.fetchall()
             
-        # Convert to DataFrame
-        df = pd.DataFrame(results)
-        return df
+        if commit:
+            connection.commit()
+            
+        return result
     except Exception as e:
-        logger.error(f"Error getting scores from external DB: {e}")
+        logger.error(f"Database query error: {e}")
+        if commit:
+            try:
+                connection.rollback()
+            except:
+                pass
+        return None
+
+def create_tables_if_not_exist():
+    """Creates the necessary database tables if they don't exist."""
+    # Create user mapping table for Twitch to Discord
+    user_mapping_query = """
+    CREATE TABLE IF NOT EXISTS user_mapping (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        twitch_username VARCHAR(255) NOT NULL,
+        discord_id VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY twitch_username (twitch_username)
+    )
+    """
+    
+    # Create reaction roles table
+    reaction_roles_query = """
+    CREATE TABLE IF NOT EXISTS reaction_roles (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        message_id VARCHAR(255) NOT NULL,
+        emoji VARCHAR(255) NOT NULL,
+        role_id VARCHAR(255) NOT NULL,
+        UNIQUE KEY message_emoji (message_id, emoji)
+    )
+    """
+    
+    if execute_db_query(user_mapping_query, fetch=False) is not None and \
+       execute_db_query(reaction_roles_query, fetch=False) is not None:
+        logger.info("Database tables created successfully")
+        return True
+    
+    logger.error("Failed to create database tables")
+    return False
+
+def get_scores_from_external_db():
+    """Gets scores from the external database."""
+    query = """
+    SELECT 
+        user_id as id, 
+        score AS Score, 
+        lastUpdated AS RecentDate,
+        createdAt AS FirstDate,
+        username AS Username
+    FROM user_scores
+    WHERE username IS NOT NULL
+    """
+    
+    results = execute_db_query(query)
+    if not results:
+        # Attempt to read from local CSV as fallback
+        try:
+            logger.info("Database unavailable, attempting to read from local CSV")
+            if os.path.exists(SCORES_FILE):
+                df = pd.read_csv(SCORES_FILE)
+                return df
+        except Exception as e:
+            logger.error(f"Error reading local CSV file: {e}")
         return pd.DataFrame()
-    finally:
-        connection.close()
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results)
+    
+    # Backup to CSV
+    try:
+        df.to_csv(SCORES_FILE, index=False)
+        logger.info(f"Backed up scores to {SCORES_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to backup scores to CSV: {e}")
+    
+    return df
 
 def map_twitch_to_discord(twitch_username, discord_id):
     """Maps a Twitch username to a Discord ID."""
-    connection = get_db_connection()
-    if not connection:
-        return False
-    
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO user_mapping (twitch_username, discord_id) VALUES (%s, %s) "
-                "ON DUPLICATE KEY UPDATE discord_id = %s",
-                (twitch_username, discord_id, discord_id)
-            )
-        connection.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Error mapping Twitch to Discord: {e}")
-        return False
-    finally:
-        connection.close()
+    query = """
+    INSERT INTO user_mapping (twitch_username, discord_id) VALUES (%s, %s) 
+    ON DUPLICATE KEY UPDATE discord_id = %s
+    """
+    return execute_db_query(query, (twitch_username, discord_id, discord_id), fetch=False) is not None
 
 def get_discord_id_from_twitch(twitch_username):
     """Gets the Discord ID mapped to a Twitch username."""
-    connection = get_db_connection()
-    if not connection:
-        return None
+    query = "SELECT discord_id FROM user_mapping WHERE twitch_username = %s"
+    result = execute_db_query(query, (twitch_username,))
     
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT discord_id FROM user_mapping WHERE twitch_username = %s",
-                (twitch_username,)
-            )
-            result = cursor.fetchone()
-        
-        if result:
-            return result['discord_id']
-        return None
-    except Exception as e:
-        logger.error(f"Error getting Discord ID from Twitch: {e}")
-        return None
-    finally:
-        connection.close()
+    if result and len(result) > 0:
+        return result[0]['discord_id']
+    return None
 
 def get_twitch_from_discord_id(discord_id):
     """Gets the Twitch username mapped to a Discord ID."""
-    connection = get_db_connection()
-    if not connection:
-        return None
+    query = "SELECT twitch_username FROM user_mapping WHERE discord_id = %s"
+    result = execute_db_query(query, (discord_id,))
     
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT twitch_username FROM user_mapping WHERE discord_id = %s",
-                (discord_id,)
-            )
-            result = cursor.fetchone()
-        
-        if result:
-            return result['twitch_username']
-        return None
-    except Exception as e:
-        logger.error(f"Error getting Twitch from Discord ID: {e}")
-        return None
-    finally:
-        connection.close()
+    if result and len(result) > 0:
+        return result[0]['twitch_username']
+    return None
 
 def export_mappings_to_csv():
     """Exports all user mappings to a CSV file."""
-    connection = get_db_connection()
-    if not connection:
-        logger.error("Failed to connect to database for export")
-        return False, "Database connection failed"
+    query = "SELECT twitch_username, discord_id, created_at FROM user_mapping"
+    results = execute_db_query(query)
+    
+    if not results or len(results) == 0:
+        return False, "No mappings found to export"
     
     try:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT twitch_username, discord_id, created_at FROM user_mapping")
-            results = cursor.fetchall()
-        
-        if not results:
-            return False, "No mappings found to export"
-        
         # Convert to DataFrame and save to CSV
         df = pd.DataFrame(results)
         export_file = "user_mappings_export.csv"
@@ -255,8 +247,6 @@ def export_mappings_to_csv():
     except Exception as e:
         logger.error(f"Error exporting mappings: {e}")
         return False, str(e)
-    finally:
-        connection.close()
 
 def import_mappings_from_csv(file_path):
     """Imports user mappings from a CSV file."""
@@ -265,14 +255,14 @@ def import_mappings_from_csv(file_path):
         if 'twitch_username' not in df.columns or 'discord_id' not in df.columns:
             return False, "CSV file does not have required columns (twitch_username, discord_id)"
         
+        success_count = 0
+        error_count = 0
+        
         connection = get_db_connection()
         if not connection:
             return False, "Database connection failed"
         
         try:
-            success_count = 0
-            error_count = 0
-            
             with connection.cursor() as cursor:
                 for _, row in df.iterrows():
                     try:
@@ -289,66 +279,41 @@ def import_mappings_from_csv(file_path):
             return True, f"Imported {success_count} mappings successfully. {error_count} errors."
         except Exception as e:
             logger.error(f"Error during import: {e}")
+            connection.rollback()
             return False, str(e)
-        finally:
-            connection.close()
     except Exception as e:
         logger.error(f"Error reading CSV: {e}")
         return False, str(e)
 
 def save_reaction_role(message_id, emoji, role_id):
     """Saves a reaction role mapping to the database."""
-    connection = get_db_connection()
-    if not connection:
-        logger.error("Failed to save reaction role - no database connection")
-        return False
-    
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO reaction_roles (message_id, emoji, role_id) VALUES (%s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE role_id = %s",
-                (str(message_id), str(emoji), str(role_id), str(role_id))
-            )
-        
-        connection.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Error saving reaction role: {e}")
-        return False
-    finally:
-        connection.close()
+    query = """
+    INSERT INTO reaction_roles (message_id, emoji, role_id) VALUES (%s, %s, %s) 
+    ON DUPLICATE KEY UPDATE role_id = %s
+    """
+    return execute_db_query(query, (str(message_id), str(emoji), str(role_id), str(role_id)), fetch=False) is not None
 
 def get_reaction_roles():
     """Gets all reaction role mappings from the database."""
-    connection = get_db_connection()
-    if not connection:
-        logger.error("Failed to get reaction roles - no database connection")
+    query = "SELECT message_id, emoji, role_id FROM reaction_roles"
+    results = execute_db_query(query)
+    
+    if not results:
         return {}
     
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT message_id, emoji, role_id FROM reaction_roles")
-            results = cursor.fetchall()
+    # Structure as a nested dictionary for easy lookup
+    reaction_roles = {}
+    for row in results:
+        message_id = row["message_id"]
+        emoji = row["emoji"]
+        role_id = row["role_id"]
         
-        # Structure as a nested dictionary for easy lookup
-        reaction_roles = {}
-        for row in results:
-            message_id = row["message_id"]
-            emoji = row["emoji"]
-            role_id = row["role_id"]
-            
-            if message_id not in reaction_roles:
-                reaction_roles[message_id] = {}
-            
-            reaction_roles[message_id][emoji] = role_id
+        if message_id not in reaction_roles:
+            reaction_roles[message_id] = {}
         
-        return reaction_roles
-    except Exception as e:
-        logger.error(f"Error getting reaction roles: {e}")
-        return {}
-    finally:
-        connection.close()
+        reaction_roles[message_id][emoji] = role_id
+    
+    return reaction_roles
 
 # ------------------------------------------------------------
 # 5) ON_READY EVENT (STARTS SCHEDULED TASKS)
@@ -516,6 +481,7 @@ async def whoami(ctx):
 
 @bot.command()
 async def member_count(ctx):
+    """Shows the number of members in the guild."""
     guild = ctx.guild
     if guild:
         embed = discord.Embed(
@@ -598,6 +564,9 @@ async def custom_help(ctx):
 
 **?member_count**
 - Shows how many members the bot can see.
+
+**?help**
+- Shows this help message.
 """
     embed.add_field(name="User Commands", value=user_commands, inline=False)
     
@@ -783,7 +752,7 @@ async def create_role_message(ctx, *, title="React to get roles!"):
     # Send the message
     message = await ctx.send(embed=embed)
     
-    # Add reactions
+    # Add reactions and save to database
     for emoji in REACTION_ROLES.keys():
         await message.add_reaction(emoji)
         
@@ -795,18 +764,19 @@ async def create_role_message(ctx, *, title="React to get roles!"):
         else:
             await ctx.send(f"⚠️ Warning: Role '{REACTION_ROLES[emoji]}' not found in server.")
     
-        success_embed = discord.Embed(
-            title="✅ Role Message Created",
-            description="The reaction role menu has been set up successfully!",
-            color=discord.Color.green()
-        )
-        await ctx.send(embed=success_embed, delete_after=5.0)  # Auto-delete after 5 seconds
+    # Send success message once after all reactions are added
+    success_embed = discord.Embed(
+        title="✅ Role Message Created",
+        description="The reaction role menu has been set up successfully!",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=success_embed, delete_after=5.0)  # Auto-delete after 5 seconds
 
 @bot.event
 async def on_raw_reaction_add(payload):
     """Handles adding roles when users react to messages."""
-    # Ignore bot reactions
-    if payload.member.bot:
+    # Ignore bot reactions (must check if member exists first)
+    if not payload.member or payload.member.bot:
         return
     
     # Get all reaction roles from the database
@@ -883,14 +853,14 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CommandNotFound):
         embed = discord.Embed(
             title="Command Not Found",
-            description=f"Command not found. Try `?helpme` for a list of commands.",
+            description=f"Command not found. Try `?help` for a list of commands.",
             color=discord.Color.orange()
         )
         await ctx.send(embed=embed)
     elif isinstance(error, commands.MissingRequiredArgument):
         embed = discord.Embed(
             title="Missing Argument",
-            description=f"Missing required argument: {error.param.name}. Try `?helpme` for usage help.",
+            description=f"Missing required argument: {error.param.name}. Try `?help` for usage help.",
             color=discord.Color.yellow()
         )
         await ctx.send(embed=embed)
