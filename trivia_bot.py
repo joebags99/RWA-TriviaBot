@@ -352,16 +352,86 @@ async def on_ready():
 @bot.command()
 async def leaderboard(ctx):
     """Displays the current leaderboard."""
+    # Try to get scores from database or CSV
     scores_df = get_scores_from_external_db()
+    
+    # Use local CSV file as a fallback
     if scores_df.empty:
-        await ctx.send("No scores available!")
+        try:
+            logger.info("Attempting to read directly from CSV file")
+            if os.path.exists(SCORES_FILE):
+                scores_df = pd.read_csv(SCORES_FILE)
+            
+            if scores_df.empty:
+                await ctx.send("No scores available!")
+                return
+        except Exception as e:
+            logger.error(f"Error reading CSV file: {e}")
+            await ctx.send("No scores available!")
+            return
+    
+    # Check if we're using the database format or the CSV format
+    # Database format has RecentDate, CSV format has Month
+    date_column = None
+    if 'RecentDate' in scores_df.columns:
+        date_column = 'RecentDate'
+    elif 'Month' in scores_df.columns:
+        date_column = 'Month'
+    else:
+        # Try to identify any date-like column
+        for col in scores_df.columns:
+            if any(date_term in col.lower() for date_term in ['date', 'time', 'month', 'year']):
+                date_column = col
+                break
+    
+    if not date_column:
+        logger.error("No date column found in data")
+        await ctx.send("Error: Could not identify date information in the data.")
         return
     
-    # Find the most recent date in the database
-    most_recent_date = scores_df['RecentDate'].max()
+    # Find the most recent date in the dataset
+    most_recent_date = scores_df[date_column].max()
     
     # Filter scores from the most recent date
-    recent_scores = scores_df[scores_df['RecentDate'] == most_recent_date].sort_values(by='Score', ascending=False)
+    recent_scores = scores_df[scores_df[date_column] == most_recent_date]
+    
+    # Determine which column is the score column
+    score_column = None
+    if 'Score' in scores_df.columns:
+        score_column = 'Score'
+    else:
+        # Try to identify any score-like column
+        numeric_columns = scores_df.select_dtypes(include=['number']).columns
+        for col in numeric_columns:
+            if col != 'id' and col != date_column:  # Skip id and date columns
+                score_column = col
+                break
+    
+    if not score_column:
+        logger.error("No score column found in data")
+        await ctx.send("Error: Could not identify score information in the data.")
+        return
+    
+    # Sort by score
+    recent_scores = recent_scores.sort_values(by=score_column, ascending=False)
+    
+    # Determine which column contains usernames
+    username_column = None
+    if 'Username' in scores_df.columns:
+        username_column = 'Username'
+    elif 'User' in scores_df.columns:
+        username_column = 'User'
+    else:
+        # Try to find any column that might contain usernames
+        for col in scores_df.columns:
+            if any(user_term in col.lower() for user_term in ['user', 'name', 'player']):
+                username_column = col
+                break
+    
+    if not username_column:
+        logger.error("No username column found in data")
+        await ctx.send("Error: Could not identify user information in the data.")
+        return
     
     # Create embed for leaderboard
     embed = discord.Embed(
@@ -372,11 +442,19 @@ async def leaderboard(ctx):
     
     # Add top 10 scores
     for i, (_, row) in enumerate(recent_scores.head(10).iterrows()):
-        username = row['Username'] if row['Username'] else "Unknown"
-        score = row['Score']
+        username_value = row.get(username_column, "Unknown")
+        # Handle numeric user IDs - convert to string
+        if isinstance(username_value, (int, float)):
+            username_value = str(int(username_value))
         
-        # Try to get Discord user if mapped
-        discord_id = get_discord_id_from_twitch(username)
+        username = username_value if username_value else "Unknown"
+        score = row.get(score_column, 0)
+        
+        # Try to get Discord user if mapped - only if username is a string
+        discord_id = None
+        if isinstance(username, str) and not username.isdigit():
+            discord_id = get_discord_id_from_twitch(username)
+        
         if discord_id:
             embed.add_field(
                 name=f"{i+1}. {username}",
@@ -396,13 +474,74 @@ async def leaderboard(ctx):
 @bot.command()
 async def total_leaderboard(ctx):
     """Displays the all-time leaderboard."""
+    # Try to get scores from database or CSV
     scores_df = get_scores_from_external_db()
+    
+    # Use local CSV file as a fallback
     if scores_df.empty:
-        await ctx.send("No scores available!")
+        try:
+            logger.info("Attempting to read directly from CSV file")
+            if os.path.exists(SCORES_FILE):
+                scores_df = pd.read_csv(SCORES_FILE)
+            
+            if scores_df.empty:
+                await ctx.send("No scores available!")
+                return
+        except Exception as e:
+            logger.error(f"Error reading CSV file: {e}")
+            await ctx.send("No scores available!")
+            return
+    
+    # Determine which column is the score column
+    score_column = None
+    if 'Score' in scores_df.columns:
+        score_column = 'Score'
+    else:
+        # Try to identify any score-like column
+        numeric_columns = scores_df.select_dtypes(include=['number']).columns
+        for col in numeric_columns:
+            if col != 'id':  # Skip id column
+                score_column = col
+                break
+    
+    if not score_column:
+        logger.error("No score column found in data")
+        await ctx.send("Error: Could not identify score information in the data.")
         return
     
-    # Sort by score
-    all_time_scores = scores_df.sort_values(by='Score', ascending=False)
+    # For total leaderboard, we need to group by user and sum scores
+    username_column = None
+    if 'Username' in scores_df.columns:
+        username_column = 'Username'
+    elif 'User' in scores_df.columns:
+        username_column = 'User'
+    else:
+        # Try to find any column that might contain usernames
+        for col in scores_df.columns:
+            if any(user_term in col.lower() for user_term in ['user', 'name', 'player']):
+                username_column = col
+                break
+    
+    if not username_column:
+        logger.error("No username column found in data")
+        await ctx.send("Error: Could not identify user information in the data.")
+        return
+    
+    # If we're using the CSV format, we need to group by user and sum scores
+    try:
+        if 'Month' in scores_df.columns:
+            # Group by user and sum scores
+            all_time_scores = scores_df.groupby(username_column)[score_column].sum().reset_index()
+        else:
+            # If using the database format, just sort by score
+            all_time_scores = scores_df
+        
+        # Sort by score
+        all_time_scores = all_time_scores.sort_values(by=score_column, ascending=False)
+    except Exception as e:
+        logger.error(f"Error processing scores: {e}")
+        await ctx.send(f"Error processing scores: {str(e)}")
+        return
     
     # Create embed for leaderboard
     embed = discord.Embed(
@@ -413,11 +552,19 @@ async def total_leaderboard(ctx):
     
     # Add top 10 scores
     for i, (_, row) in enumerate(all_time_scores.head(10).iterrows()):
-        username = row['Username'] if row['Username'] else "Unknown"
-        score = row['Score']
+        username_value = row.get(username_column, "Unknown")
+        # Handle numeric user IDs - convert to string
+        if isinstance(username_value, (int, float)):
+            username_value = str(int(username_value))
         
-        # Try to get Discord user if mapped
-        discord_id = get_discord_id_from_twitch(username)
+        username = username_value if username_value else "Unknown"
+        score = row.get(score_column, 0)
+        
+        # Try to get Discord user if mapped - only if username is a string
+        discord_id = None
+        if isinstance(username, str) and not username.isdigit():
+            discord_id = get_discord_id_from_twitch(username)
+        
         if discord_id:
             embed.add_field(
                 name=f"{i+1}. {username}",
