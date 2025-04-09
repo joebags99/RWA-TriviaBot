@@ -1252,51 +1252,7 @@ async def on_command_error(ctx, error):
         await ctx.send(embed=embed)
 
 # ------------------------------------------------------------
-# 11) RUN THE BOT
-# ------------------------------------------------------------
-if __name__ == "__main__":
-    # Check for existing instance using file locking
-    import sys
-    import fcntl  # For Linux/Unix
-    
-    try:
-        # Try to create and lock a file
-        lock_file = open("trivia_bot.lock", "w")
-        
-        try:
-            # For Windows
-            import msvcrt
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-            is_locked = True
-        except ImportError:
-            # For Unix/Linux
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                is_locked = True
-            except IOError:
-                is_locked = False
-        
-        if not is_locked:
-            logger.critical("Another instance of the bot is already running! Exiting.")
-            sys.exit(1)
-            
-        logger.info("No other instances detected. Starting bot...")
-        
-        # Attempt to create database tables before starting the bot
-        create_tables_if_not_exist()
-        
-        # Run the bot with error handling
-        try:
-            bot.run(TOKEN)
-        except Exception as e:
-            logger.critical(f"Bot crashed: {e}")
-            
-    except IOError:
-        logger.critical("Could not create lock file. Another instance may be running.")
-        sys.exit(1)
-
-# ------------------------------------------------------------
-# 12) LINK TWITCH UI
+# 11) LINK TWITCH UI
 # ------------------------------------------------------------
 class LinkTwitchModal(Modal, title="Link Twitch Account"):
     def __init__(self, member):
@@ -1382,3 +1338,47 @@ async def link_twitch_ui(ctx):
     """Opens an interactive UI for linking Discord users to Twitch usernames."""
     view = LinkTwitchView(ctx)
     await ctx.send("Click the button below to link a Discord user to a Twitch username:", view=view)
+
+# ------------------------------------------------------------
+# 12) RUN THE BOT
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # Check for existing instance using file locking
+    import sys
+    import fcntl  # For Linux/Unix
+    
+    try:
+        # Try to create and lock a file
+        lock_file = open("trivia_bot.lock", "w")
+        
+        try:
+            # For Windows
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            is_locked = True
+        except ImportError:
+            # For Unix/Linux
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                is_locked = True
+            except IOError:
+                is_locked = False
+        
+        if not is_locked:
+            logger.critical("Another instance of the bot is already running! Exiting.")
+            sys.exit(1)
+            
+        logger.info("No other instances detected. Starting bot...")
+        
+        # Attempt to create database tables before starting the bot
+        create_tables_if_not_exist()
+        
+        # Run the bot with error handling
+        try:
+            bot.run(TOKEN)
+        except Exception as e:
+            logger.critical(f"Bot crashed: {e}")
+            
+    except IOError:
+        logger.critical("Could not create lock file. Another instance may be running.")
+        sys.exit(1)
