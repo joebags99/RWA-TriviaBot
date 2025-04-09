@@ -170,8 +170,8 @@ def get_scores_from_external_db():
     """Gets scores from the external database."""
     query = """
     SELECT 
-        user_id as id, 
-        score AS Score, 
+        UserId as id, 
+        score AS Score,  
         lastUpdated AS RecentDate,
         createdAt AS FirstDate,
         username AS Username
@@ -193,6 +193,16 @@ def get_scores_from_external_db():
     
     # Convert to DataFrame
     df = pd.DataFrame(results)
+    
+    # Verify required columns exist
+    if 'Score' not in df.columns or 'Username' not in df.columns:
+        logger.error(f"Missing required columns. Available columns: {df.columns.tolist()}")
+        
+        # Try to fix column names if possible
+        if 'score' in df.columns and 'Score' not in df.columns:
+            df['Score'] = df['score']
+        if 'username' in df.columns and 'Username' not in df.columns:
+            df['Username'] = df['username']
     
     # Backup to CSV
     try:
@@ -440,12 +450,18 @@ class LeaderboardView(View):
         
         embed = discord.Embed(title=title, description=description, color=color)
         
-        # Determine which columns to use
-        score_column = 'Score' if 'Score' in self.scores_df.columns else None
-        username_column = 'Username' if 'Username' in self.scores_df.columns else None
+        # Debug column information
+        available_columns = self.scores_df.columns.tolist()
+        
+        # Determine which columns to use (case-insensitive matching)
+        score_column = next((col for col in available_columns if col.lower() == 'score'), None)
+        username_column = next((col for col in available_columns if col.lower() == 'username'), None)
         
         if not score_column or not username_column:
-            embed.add_field(name="Error", value="Could not determine score or username columns")
+            embed.add_field(
+                name="Error", 
+                value=f"Could not determine score or username columns. Available columns: {', '.join(available_columns)}"
+            )
             return embed
         
         # Add each entry to the embed
