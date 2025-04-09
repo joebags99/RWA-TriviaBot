@@ -1322,16 +1322,20 @@ async def test_feed(ctx):
     
     try:
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
-        feed = feedparser.parse(rss_url, timeout=10)
+        feed = feedparser.parse(rss_url)  # Remove timeout parameter
         
-        if feed.entries:
+        if feed.entries and len(feed.entries) > 0:
             await ctx.send(f"Feed parsed successfully! Found {len(feed.entries)} videos.")
             
             # Get details of first entry for debugging
             first = feed.entries[0]
-            debug_info = f"First video:\n"
-            debug_info += f"Available attributes: {', '.join(dir(first)[:20])}...\n"
-            debug_info += f"Feed version: {feed.version}\n"
+            
+            # More detailed debug info
+            debug_info = "First video details:\n"
+            debug_info += f"- Title: {first.title if hasattr(first, 'title') else 'No title'}\n"
+            debug_info += f"- ID: {first.id if hasattr(first, 'id') else 'No ID'}\n"
+            debug_info += f"- Link: {first.link if hasattr(first, 'link') else 'No link'}\n"
+            debug_info += f"- Published: {first.published if hasattr(first, 'published') else 'No date'}\n"
             
             await ctx.send(debug_info)
         else:
@@ -1492,21 +1496,24 @@ def get_latest_youtube_video():
         logger.info(f"Fetching YouTube RSS feed for channel: {YOUTUBE_CHANNEL_ID}")
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
         
-        # Add timeout to prevent hanging
-        feed = feedparser.parse(rss_url, timeout=10)
+        # Remove the timeout parameter that's causing errors
+        feed = feedparser.parse(rss_url)
         
         logger.info(f"Feed entries found: {len(feed.entries)}")
         
-        if feed.entries:
+        if feed.entries and len(feed.entries) > 0:
             latest_video = feed.entries[0]
             
-            # Check if required attributes exist
-            if not hasattr(latest_video, 'yt_videoid'):
-                # Try alternative attribute names or extraction methods
-                video_id = latest_video.id.split(':')[-1] if hasattr(latest_video, 'id') else None
-                logger.warning(f"yt_videoid attribute missing, extracted: {video_id}")
+            # Debug info
+            logger.info(f"Available attributes: {dir(latest_video)}")
+            
+            # Standard YouTube ID extraction from feed entry ID 
+            # Format is typically "yt:video:VIDEO_ID"
+            if hasattr(latest_video, 'id'):
+                video_id = latest_video.id.split(':')[-1]
             else:
-                video_id = latest_video.yt_videoid
+                logger.error("No ID field in the feed entry")
+                return None
                 
             video_title = latest_video.title if hasattr(latest_video, 'title') else "Unknown Title"
             video_url = latest_video.link if hasattr(latest_video, 'link') else f"https://www.youtube.com/watch?v={video_id}"
