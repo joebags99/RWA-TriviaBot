@@ -1569,16 +1569,32 @@ def get_twitch_access_token():
     
     try:
         url = "https://id.twitch.tv/oauth2/token"
+        
+        # Use json parameter instead of data for proper content-type
         payload = {
             'client_id': TWITCH_CLIENT_ID,
             'client_secret': TWITCH_CLIENT_SECRET,
             'grant_type': 'client_credentials'
         }
         
-        response = requests.post(url, data=payload)
-        response.raise_for_status()
+        # Add explicit headers
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        # Log attempt (without exposing secret)
+        logger.info(f"Attempting Twitch auth with client ID: {TWITCH_CLIENT_ID[:5]}...")
+        
+        # Use json parameter to ensure proper formatting
+        response = requests.post(url, json=payload, headers=headers)
+        
+        # If error, get more detailed information
+        if response.status_code != 200:
+            logger.error(f"Twitch auth error {response.status_code}: {response.text}")
+            response.raise_for_status()
         
         data = response.json()
+        logger.info("Successfully obtained Twitch access token")
         return data.get('access_token')
     except Exception as e:
         logger.error(f"Error getting Twitch access token: {e}")
