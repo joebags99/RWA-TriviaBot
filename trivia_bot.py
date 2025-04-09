@@ -158,13 +158,129 @@ def create_tables_if_not_exist():
     )
     """
     
+    # Create weekly score snapshots table
+    score_snapshot_query = """
+    CREATE TABLE IF NOT EXISTS score_snapshots (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(255) NOT NULL,
+        score INT NOT NULL,
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        snapshot_type VARCHAR(50) NOT NULL,
+        INDEX (username, snapshot_type)
+    )
+    """
+    
     if execute_db_query(user_mapping_query, fetch=False) is not None and \
-       execute_db_query(reaction_roles_query, fetch=False) is not None:
+       execute_db_query(reaction_roles_query, fetch=False) is not None and \
+       execute_db_query(score_snapshot_query, fetch=False) is not None:
         logger.info("Database tables created successfully")
         return True
     
     logger.error("Failed to create database tables")
     return False
+
+# Add functions to handle weekly snapshots
+def take_score_snapshot(snapshot_type="weekly"):
+    """Takes a snapshot of current scores for future comparison."""
+    scores_df = get_scores_from_external_db()
+    if scores_df.empty:
+        logger.warning("No scores available for snapshot")
+        return False
+    
+    # Get the right column names
+    username_column = next((col for col in scores_df.columns if col.lower() == 'username'), None)
+    score_column = next((col for col in scores_df.columns if col.lower() == 'score'), None)
+    
+    if not username_column or not score_column:
+        logger.error(f"Missing required columns for snapshot. Available: {scores_df.columns.tolist()}")
+        return False
+    
+    # Create a transaction to save all snapshots
+    connection = get_db_connection()
+    if not connection:
+        return False
+    
+    try:
+        with connection.cursor() as cursor:
+            # Clear old snapshots of this type first
+            cursor.execute(
+                "DELETE FROM score_snapshots WHERE snapshot_type = %s", 
+                (snapshot_type,)
+            )
+            
+            # Insert new snapshots
+            for _, row in scores_df.iterrows():
+                username = row[username_column]
+                score = row[score_column]
+                
+                cursor.execute(
+                    "INSERT INTO score_snapshots (username, score, snapshot_type) VALUES (%s, %s, %s)",
+                    (username, score, snapshot_type)
+                )
+        
+        connection.commit()
+        logger.info(f"Successfully created {snapshot_type} snapshot for {len(scores_df)} users")
+        return True
+    except Exception as e:
+        logger.error(f"Error taking snapshot: {e}")
+        connection.rollback()
+        return False
+
+def get_session_scores():
+    """Gets scores for the current session by comparing with last snapshot."""
+    # Get current scores
+    current_scores = get_scores_from_external_db()
+    if current_scores.empty:
+        return pd.DataFrame()
+    
+    # Get the right column names
+    username_column = next((col for col in current_scores.columns if col.lower() == 'username'), None)
+    score_column = next((col for col in current_scores.columns if col.lower() == 'score'), None)
+    
+    if not username_column or not score_column:
+        logger.error(f"Missing required columns. Available: {current_scores.columns.tolist()}")
+        return pd.DataFrame()
+    
+    # Get snapshot scores
+    query = """
+    SELECT username, score, snapshot_date
+    FROM score_snapshots
+    WHERE snapshot_type = 'weekly'
+    """
+    
+    results = execute_db_query(query)
+    if not results:
+        # No snapshot exists yet, return current scores as session scores
+        current_scores['SessionScore'] = current_scores[score_column]
+        return current_scores
+    
+    # Convert to DataFrame
+    snapshot_df = pd.DataFrame(results)
+    
+    # Merge the dataframes on username
+    merged_df = pd.merge(
+        current_scores,
+        snapshot_df,
+        left_on=username_column,
+        right_on='username',
+        how='left'
+    )
+    
+    # Fill missing snapshot scores with zeros
+    merged_df['score'] = merged_df['score'].fillna(0)
+    
+    # Calculate session score (current - snapshot)
+    merged_df['SessionScore'] = merged_df[score_column] - merged_df['score']
+    
+    # Make sure session scores aren't negative
+    merged_df['SessionScore'] = merged_df['SessionScore'].apply(lambda x: max(0, x))
+    
+    # Add snapshot date for reference
+    if not merged_df.empty and 'snapshot_date' in merged_df.columns:
+        snapshot_date = merged_df['snapshot_date'].iloc[0]
+        merged_df['SnapshotDate'] = snapshot_date
+    
+    return merged_df
 
 def get_scores_from_external_db():
     """Gets scores from the external database."""
@@ -360,12 +476,13 @@ async def on_ready():
 # 6) LEADERBOARD AND USER COMMANDS
 # ------------------------------------------------------------
 class LeaderboardView(View):
-    def __init__(self, scores_df, is_total=False, page=0, page_size=10):
+    def __init__(self, scores_df, is_total=False, page=0, page_size=10, score_column=None):
         super().__init__(timeout=180)  # 3 minute timeout
         self.scores_df = scores_df
         self.is_total = is_total
         self.page = page
         self.page_size = page_size
+        self.custom_score_column = score_column  # Allow custom score column
         self.max_pages = max(1, (len(scores_df) + page_size - 1) // page_size)
         self.update_buttons()
     
@@ -439,14 +556,24 @@ class LeaderboardView(View):
         page_data = self.scores_df.iloc[start_idx:end_idx]
         
         # Determine title and color based on view type
-        title = "🏆 All-Time Leaderboard" if self.is_total else "📜 Current Leaderboard"
-        color = discord.Color.purple() if self.is_total else discord.Color.gold()
+        if self.custom_score_column == 'SessionScore':
+            title = "📊 Session Leaderboard"
+            color = discord.Color.teal()
+            description = "Scores earned since the last snapshot"
+        else:
+            title = "🏆 All-Time Leaderboard" if self.is_total else "📜 Current Leaderboard"
+            color = discord.Color.purple() if self.is_total else discord.Color.gold()
+            description = "Top scores across all time" if self.is_total else "Current top scores"
         
         # Get date if available for weekly view
-        description = "Top scores across all time" if self.is_total else "Current top scores"
         if not self.is_total and 'RecentDate' in self.scores_df.columns:
             most_recent_date = self.scores_df['RecentDate'].max()
             description = f"Top scores as of {most_recent_date}"
+        
+        # Add snapshot date if available
+        if 'SnapshotDate' in self.scores_df.columns and not self.scores_df.empty:
+            snapshot_date = self.scores_df['SnapshotDate'].iloc[0]
+            description = f"{description} (since {snapshot_date})"
         
         embed = discord.Embed(title=title, description=description, color=color)
         
@@ -454,7 +581,7 @@ class LeaderboardView(View):
         available_columns = self.scores_df.columns.tolist()
         
         # Determine which columns to use (case-insensitive matching)
-        score_column = next((col for col in available_columns if col.lower() == 'score'), None)
+        score_column = self.custom_score_column if self.custom_score_column else next((col for col in available_columns if col.lower() == 'score'), None)
         username_column = next((col for col in available_columns if col.lower() == 'username'), None)
         
         if not score_column or not username_column:
@@ -516,17 +643,27 @@ async def leaderboard(ctx):
             await ctx.send("No scores available!")
             return
     
-    # Find most recent date and filter scores
-    date_column = next((col for col in scores_df.columns 
-                        if any(date_term in col.lower() 
-                              for date_term in ['date', 'time', 'month', 'year'])), None)
+    # Add debug info
+    logger.info(f"Loaded {len(scores_df)} score entries")
+    logger.info(f"Available columns: {scores_df.columns.tolist()}")
     
-    if not date_column:
-        await ctx.send("Error: Could not identify date information in the data.")
-        return
+    # Convert timestamp strings to datetime if needed
+    if 'RecentDate' in scores_df.columns and isinstance(scores_df['RecentDate'].iloc[0], str):
+        scores_df['RecentDate'] = pd.to_datetime(scores_df['RecentDate'])
     
-    most_recent_date = scores_df[date_column].max()
-    recent_scores = scores_df[scores_df[date_column] == most_recent_date]
+    # Get the most recent date by extracting just the date part (ignore time)
+    if 'RecentDate' in scores_df.columns:
+        # Add a date-only column for grouping
+        scores_df['DateOnly'] = scores_df['RecentDate'].dt.date
+        most_recent_date = scores_df['DateOnly'].max()
+        
+        # Filter to most recent date (date part only)
+        recent_scores = scores_df[scores_df['DateOnly'] == most_recent_date]
+    else:
+        # Fallback if RecentDate is not available
+        recent_scores = scores_df
+    
+    # Sort and show all scores from the most recent date
     recent_scores = recent_scores.sort_values(by='Score', ascending=False)
     
     # Create interactive view
@@ -569,6 +706,26 @@ async def total_leaderboard(ctx):
     
     # Create interactive view
     view = LeaderboardView(all_time_scores, is_total=True)
+    
+    # Send message with view
+    await ctx.send(embed=view.get_embed(), view=view)
+
+@bot.command()
+async def session_leaderboard(ctx):
+    """Displays the leaderboard for the current session/week."""
+    # Get session scores
+    session_scores_df = get_session_scores()
+    
+    if session_scores_df.empty:
+        await ctx.send("No session scores available!")
+        return
+    
+    # Sort by session score
+    if 'SessionScore' in session_scores_df.columns:
+        session_scores_df = session_scores_df.sort_values(by='SessionScore', ascending=False)
+    
+    # Create interactive view
+    view = LeaderboardView(session_scores_df, is_total=False, score_column='SessionScore')
     
     # Send message with view
     await ctx.send(embed=view.get_embed(), view=view)
@@ -681,6 +838,27 @@ async def import_mappings(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error processing the file: {str(e)}")
 
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def take_snapshot(ctx):
+    """Takes a snapshot of current scores for session tracking."""
+    success = take_score_snapshot("weekly")
+    
+    if success:
+        embed = discord.Embed(
+            title="Snapshot Created",
+            description="Successfully created a snapshot of current scores for session tracking.",
+            color=discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="Error",
+            description="Failed to create score snapshot.",
+            color=discord.Color.red()
+        )
+    
+    await ctx.send(embed=embed)
+
 class HelpView(View):
     def __init__(self):
         super().__init__(timeout=180)  # 3 minute timeout
@@ -697,6 +875,7 @@ class HelpView(View):
         commands = {
             "?leaderboard": "Shows the current leaderboard with interactive controls.",
             "?total_leaderboard": "Shows the all-time leaderboard with interactive controls.",
+            "?session_leaderboard": "Shows scores earned during the current session.",
             "?whoami": "Shows which Twitch username is linked to your Discord account.",
             "?member_count": "Shows how many members the bot can see.",
             "?help": "Shows this interactive help menu."
@@ -724,7 +903,8 @@ class HelpView(View):
             "?create_role_message Title": "Creates an interactive role selection menu.",
             "?export_mappings": "Exports all Twitch-Discord user mappings to a CSV file.",
             "?import_mappings": "Imports Twitch-Discord mappings from an attached CSV file.",
-            "?link_twitch_ui": "Opens an interactive UI for linking Discord users to Twitch usernames."
+            "?link_twitch_ui": "Opens an interactive UI for linking Discord users to Twitch usernames.",
+            "?take_snapshot": "Takes a snapshot of current scores for session tracking."
         }
         
         for cmd, desc in commands.items():
@@ -1020,13 +1200,18 @@ async def schedule_weekly_update():
     now = datetime.now()
     # Sunday = 6, hour=1, minute=0
     if now.weekday() == 6 and now.hour == 1 and now.minute == 0:
+        # Take a weekly snapshot before updating roles
+        take_score_snapshot("weekly")
+        
+        # Update champion roles
         await update_champion_roles()
+        
         # Optionally, send a message to a channel:
         channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
         if channel:
             embed = discord.Embed(
-                title="Champion Roles Updated",
-                description="Weekly champion roles have been updated!",
+                title="Weekly Update Complete",
+                description="Champion roles have been updated and score snapshot taken!",
                 color=discord.Color.gold()
             )
             await channel.send(embed=embed)
