@@ -2,14 +2,14 @@ import os
 import pandas as pd
 import discord
 from discord.ext import commands, tasks
+from discord.ui import Button, View, Select, Modal, TextInput
+import logging
 from datetime import datetime, timedelta
 import asyncio
 import requests
 import json
 import pymysql
 import pymysql.cursors
-from discord.ui import Button, View
-import logging
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -349,13 +349,143 @@ async def on_ready():
 # ------------------------------------------------------------
 # 6) LEADERBOARD AND USER COMMANDS
 # ------------------------------------------------------------
+class LeaderboardView(View):
+    def __init__(self, scores_df, is_total=False, page=0, page_size=10):
+        super().__init__(timeout=180)  # 3 minute timeout
+        self.scores_df = scores_df
+        self.is_total = is_total
+        self.page = page
+        self.page_size = page_size
+        self.max_pages = max(1, (len(scores_df) + page_size - 1) // page_size)
+        self.update_buttons()
+    
+    def update_buttons(self):
+        self.clear_items()
+        
+        # Previous page button
+        prev_button = Button(
+            label="◀️ Previous", 
+            style=discord.ButtonStyle.primary, 
+            disabled=(self.page <= 0),
+            custom_id="prev_page"
+        )
+        prev_button.callback = self.previous_page
+        self.add_item(prev_button)
+        
+        # Page indicator
+        page_indicator = Button(
+            label=f"Page {self.page + 1}/{self.max_pages}", 
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+            custom_id="page_indicator"
+        )
+        self.add_item(page_indicator)
+        
+        # Next page button
+        next_button = Button(
+            label="Next ▶️", 
+            style=discord.ButtonStyle.primary,
+            disabled=(self.page >= self.max_pages - 1),
+            custom_id="next_page"
+        )
+        next_button.callback = self.next_page
+        self.add_item(next_button)
+        
+        # Toggle button
+        toggle_label = "Show Weekly Scores" if self.is_total else "Show All-Time Scores"
+        toggle_button = Button(
+            label=toggle_label,
+            style=discord.ButtonStyle.success,
+            custom_id="toggle_view"
+        )
+        toggle_button.callback = self.toggle_view
+        self.add_item(toggle_button)
+    
+    async def previous_page(self, interaction):
+        if self.page > 0:
+            self.page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        else:
+            await interaction.response.defer()
+    
+    async def next_page(self, interaction):
+        if self.page < self.max_pages - 1:
+            self.page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+        else:
+            await interaction.response.defer()
+    
+    async def toggle_view(self, interaction):
+        self.is_total = not self.is_total
+        self.page = 0  # Reset to first page
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    
+    def get_embed(self):
+        start_idx = self.page * self.page_size
+        end_idx = min(start_idx + self.page_size, len(self.scores_df))
+        page_data = self.scores_df.iloc[start_idx:end_idx]
+        
+        # Determine title and color based on view type
+        title = "🏆 All-Time Leaderboard" if self.is_total else "📜 Current Leaderboard"
+        color = discord.Color.purple() if self.is_total else discord.Color.gold()
+        
+        # Get date if available for weekly view
+        description = "Top scores across all time" if self.is_total else "Current top scores"
+        if not self.is_total and 'RecentDate' in self.scores_df.columns:
+            most_recent_date = self.scores_df['RecentDate'].max()
+            description = f"Top scores as of {most_recent_date}"
+        
+        embed = discord.Embed(title=title, description=description, color=color)
+        
+        # Determine which columns to use
+        score_column = 'Score' if 'Score' in self.scores_df.columns else None
+        username_column = 'Username' if 'Username' in self.scores_df.columns else None
+        
+        if not score_column or not username_column:
+            embed.add_field(name="Error", value="Could not determine score or username columns")
+            return embed
+        
+        # Add each entry to the embed
+        for i, (_, row) in enumerate(page_data.iterrows()):
+            rank = start_idx + i + 1
+            username = row.get(username_column, "Unknown")
+            score = row.get(score_column, 0)
+            
+            # Handle numeric usernames
+            if isinstance(username, (int, float)):
+                username = str(int(username))
+            
+            # Try to get Discord user if mapped
+            discord_id = None
+            if isinstance(username, str) and not username.isdigit():
+                discord_id = get_discord_id_from_twitch(username)
+            
+            # Format the leaderboard entry
+            if discord_id:
+                embed.add_field(
+                    name=f"{rank}. {username}",
+                    value=f"<@{discord_id}> • {score} points",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"{rank}. {username}",
+                    value=f"{score} points",
+                    inline=False
+                )
+        
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        return embed
+
 @bot.command()
 async def leaderboard(ctx):
-    """Displays the current leaderboard."""
+    """Displays the current leaderboard with interactive controls."""
     # Try to get scores from database or CSV
     scores_df = get_scores_from_external_db()
     
-    # Use local CSV file as a fallback
     if scores_df.empty:
         try:
             logger.info("Attempting to read directly from CSV file")
@@ -370,117 +500,33 @@ async def leaderboard(ctx):
             await ctx.send("No scores available!")
             return
     
-    # Check if we're using the database format or the CSV format
-    # Database format has RecentDate, CSV format has Month
-    date_column = None
-    if 'RecentDate' in scores_df.columns:
-        date_column = 'RecentDate'
-    elif 'Month' in scores_df.columns:
-        date_column = 'Month'
-    else:
-        # Try to identify any date-like column
-        for col in scores_df.columns:
-            if any(date_term in col.lower() for date_term in ['date', 'time', 'month', 'year']):
-                date_column = col
-                break
+    # Find most recent date and filter scores
+    date_column = next((col for col in scores_df.columns 
+                        if any(date_term in col.lower() 
+                              for date_term in ['date', 'time', 'month', 'year'])), None)
     
     if not date_column:
-        logger.error("No date column found in data")
         await ctx.send("Error: Could not identify date information in the data.")
         return
     
-    # Find the most recent date in the dataset
     most_recent_date = scores_df[date_column].max()
-    
-    # Filter scores from the most recent date
     recent_scores = scores_df[scores_df[date_column] == most_recent_date]
+    recent_scores = recent_scores.sort_values(by='Score', ascending=False)
     
-    # Determine which column is the score column
-    score_column = None
-    if 'Score' in scores_df.columns:
-        score_column = 'Score'
-    else:
-        # Try to identify any score-like column
-        numeric_columns = scores_df.select_dtypes(include=['number']).columns
-        for col in numeric_columns:
-            if col != 'id' and col != date_column:  # Skip id and date columns
-                score_column = col
-                break
+    # Create interactive view
+    view = LeaderboardView(recent_scores, is_total=False)
     
-    if not score_column:
-        logger.error("No score column found in data")
-        await ctx.send("Error: Could not identify score information in the data.")
-        return
-    
-    # Sort by score
-    recent_scores = recent_scores.sort_values(by=score_column, ascending=False)
-    
-    # Determine which column contains usernames
-    username_column = None
-    if 'Username' in scores_df.columns:
-        username_column = 'Username'
-    elif 'User' in scores_df.columns:
-        username_column = 'User'
-    else:
-        # Try to find any column that might contain usernames
-        for col in scores_df.columns:
-            if any(user_term in col.lower() for user_term in ['user', 'name', 'player']):
-                username_column = col
-                break
-    
-    if not username_column:
-        logger.error("No username column found in data")
-        await ctx.send("Error: Could not identify user information in the data.")
-        return
-    
-    # Create embed for leaderboard
-    embed = discord.Embed(
-        title="📜 Current Leaderboard",
-        description=f"Top scores as of {most_recent_date}",
-        color=discord.Color.gold()
-    )
-    
-    # Add top 10 scores
-    for i, (_, row) in enumerate(recent_scores.head(10).iterrows()):
-        username_value = row.get(username_column, "Unknown")
-        # Handle numeric user IDs - convert to string
-        if isinstance(username_value, (int, float)):
-            username_value = str(int(username_value))
-        
-        username = username_value if username_value else "Unknown"
-        score = row.get(score_column, 0)
-        
-        # Try to get Discord user if mapped - only if username is a string
-        discord_id = None
-        if isinstance(username, str) and not username.isdigit():
-            discord_id = get_discord_id_from_twitch(username)
-        
-        if discord_id:
-            embed.add_field(
-                name=f"{i+1}. {username}",
-                value=f"<@{discord_id}> • {score} points",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name=f"{i+1}. {username}",
-                value=f"{score} points",
-                inline=False
-            )
-    
-    embed.set_footer(text="Royal Scribe | Roll With Advantage")
-    await ctx.send(embed=embed)
+    # Send message with view
+    await ctx.send(embed=view.get_embed(), view=view)
 
 @bot.command()
 async def total_leaderboard(ctx):
-    """Displays the all-time leaderboard."""
-    # Try to get scores from database or CSV
+    """Displays the all-time leaderboard with interactive controls."""
+    # Similar implementation to leaderboard, but with is_total=True
     scores_df = get_scores_from_external_db()
     
-    # Use local CSV file as a fallback
     if scores_df.empty:
         try:
-            logger.info("Attempting to read directly from CSV file")
             if os.path.exists(SCORES_FILE):
                 scores_df = pd.read_csv(SCORES_FILE)
             
@@ -492,94 +538,24 @@ async def total_leaderboard(ctx):
             await ctx.send("No scores available!")
             return
     
-    # Determine which column is the score column
-    score_column = None
-    if 'Score' in scores_df.columns:
-        score_column = 'Score'
-    else:
-        # Try to identify any score-like column
-        numeric_columns = scores_df.select_dtypes(include=['number']).columns
-        for col in numeric_columns:
-            if col != 'id':  # Skip id column
-                score_column = col
-                break
-    
-    if not score_column:
-        logger.error("No score column found in data")
-        await ctx.send("Error: Could not identify score information in the data.")
-        return
-    
-    # For total leaderboard, we need to group by user and sum scores
-    username_column = None
-    if 'Username' in scores_df.columns:
-        username_column = 'Username'
-    elif 'User' in scores_df.columns:
-        username_column = 'User'
-    else:
-        # Try to find any column that might contain usernames
-        for col in scores_df.columns:
-            if any(user_term in col.lower() for user_term in ['user', 'name', 'player']):
-                username_column = col
-                break
-    
-    if not username_column:
-        logger.error("No username column found in data")
-        await ctx.send("Error: Could not identify user information in the data.")
-        return
-    
-    # If we're using the CSV format, we need to group by user and sum scores
+    # Process total scores
     try:
         if 'Month' in scores_df.columns:
-            # Group by user and sum scores
-            all_time_scores = scores_df.groupby(username_column)[score_column].sum().reset_index()
+            all_time_scores = scores_df.groupby('Username')['Score'].sum().reset_index()
         else:
-            # If using the database format, just sort by score
             all_time_scores = scores_df
         
-        # Sort by score
-        all_time_scores = all_time_scores.sort_values(by=score_column, ascending=False)
+        all_time_scores = all_time_scores.sort_values(by='Score', ascending=False)
     except Exception as e:
         logger.error(f"Error processing scores: {e}")
         await ctx.send(f"Error processing scores: {str(e)}")
         return
     
-    # Create embed for leaderboard
-    embed = discord.Embed(
-        title="🏆 All-Time Leaderboard",
-        description="Top scores across all time",
-        color=discord.Color.purple()
-    )
+    # Create interactive view
+    view = LeaderboardView(all_time_scores, is_total=True)
     
-    # Add top 10 scores
-    for i, (_, row) in enumerate(all_time_scores.head(10).iterrows()):
-        username_value = row.get(username_column, "Unknown")
-        # Handle numeric user IDs - convert to string
-        if isinstance(username_value, (int, float)):
-            username_value = str(int(username_value))
-        
-        username = username_value if username_value else "Unknown"
-        score = row.get(score_column, 0)
-        
-        # Try to get Discord user if mapped - only if username is a string
-        discord_id = None
-        if isinstance(username, str) and not username.isdigit():
-            discord_id = get_discord_id_from_twitch(username)
-        
-        if discord_id:
-            embed.add_field(
-                name=f"{i+1}. {username}",
-                value=f"<@{discord_id}> • {score} points",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name=f"{i+1}. {username}",
-                value=f"{score} points",
-                inline=False
-            )
-    
-    embed.set_footer(text="Royal Scribe | Roll With Advantage")
-    await ctx.send(embed=embed)
+    # Send message with view
+    await ctx.send(embed=view.get_embed(), view=view)
 
 @bot.command()
 @commands.has_role("Roll With Advantage!")
@@ -689,64 +665,114 @@ async def import_mappings(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error processing the file: {str(e)}")
 
+class HelpView(View):
+    def __init__(self):
+        super().__init__(timeout=180)  # 3 minute timeout
+        self.current_page = "main"
+    
+    @discord.ui.button(label="User Commands", style=discord.ButtonStyle.primary)
+    async def user_commands(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="User Commands",
+            description="Commands available to all users",
+            color=discord.Color.blue()
+        )
+        
+        commands = {
+            "?leaderboard": "Shows the current leaderboard with interactive controls.",
+            "?total_leaderboard": "Shows the all-time leaderboard with interactive controls.",
+            "?whoami": "Shows which Twitch username is linked to your Discord account.",
+            "?member_count": "Shows how many members the bot can see.",
+            "?help": "Shows this interactive help menu."
+        }
+        
+        for cmd, desc in commands.items():
+            embed.add_field(name=cmd, value=desc, inline=False)
+        
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        self.current_page = "user"
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+    
+    @discord.ui.button(label="Admin Commands", style=discord.ButtonStyle.danger)
+    async def admin_commands(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="Admin Commands",
+            description="Commands only available to admins with the 'Roll With Advantage!' role",
+            color=discord.Color.red()
+        )
+        
+        commands = {
+            "?link_twitch @User TwitchUsername": "Links a Discord user to a Twitch username.",
+            "?update_roles": "Manually updates the champion roles.",
+            "?create_role_message Title": "Creates an interactive role selection menu.",
+            "?export_mappings": "Exports all Twitch-Discord user mappings to a CSV file.",
+            "?import_mappings": "Imports Twitch-Discord mappings from an attached CSV file.",
+            "?link_twitch_ui": "Opens an interactive UI for linking Discord users to Twitch usernames."
+        }
+        
+        for cmd, desc in commands.items():
+            embed.add_field(name=cmd, value=desc, inline=False)
+        
+        embed.set_footer(text="Admin commands require the 'Roll With Advantage!' role")
+        self.current_page = "admin"
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+    
+    @discord.ui.button(label="Home", style=discord.ButtonStyle.secondary)
+    async def home_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page == "main":
+            await interaction.response.defer()
+            return
+        
+        embed = discord.Embed(
+            title="Royal Scribe Commands",
+            description="Use the buttons below to navigate the help menu.",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="User Commands", 
+            value="Commands available to all users", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Admin Commands", 
+            value="Commands for server administrators", 
+            inline=True
+        )
+        
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        self.current_page = "main"
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+
 @bot.command(name="help")
 async def custom_help(ctx):
-    """A custom help command that lists all commands and usage."""
+    """An interactive help command with buttons."""
     embed = discord.Embed(
         title="Royal Scribe Commands",
-        description="Here are the commands available in this server:",
+        description="Use the buttons below to navigate the help menu.",
         color=discord.Color.blue()
     )
     
-    # User commands
-    user_commands = """
-**?leaderboard**
-- Shows the current leaderboard.
-
-**?total_leaderboard**
-- Shows the all-time leaderboard.
-
-**?whoami**
-- Shows which Twitch username is linked to your Discord account.
-
-**?member_count**
-- Shows how many members the bot can see.
-
-**?help**
-- Shows this help message.
-"""
-    embed.add_field(name="User Commands", value=user_commands, inline=False)
+    embed.add_field(
+        name="User Commands", 
+        value="Commands available to all users", 
+        inline=True
+    )
     
-    # Admin commands
-    admin_commands = """
-**?link_twitch @User TwitchUsername**
-- Links a Discord user to a Twitch username.
-- Admin-only: requires Roll With Advantage! role.
-
-**?update_roles**
-- Manually updates the champion roles.
-- Admin-only: requires Roll With Advantage! role.
-
-**?create_reaction_role Message Emoji @Role**
-- Creates a new reaction role.
-- Admin-only: requires Roll With Advantage! role.
-
-**?create_role_message Title**
-- Creates a reaction role message with pre-defined roles.
-- Admin-only: requires Roll With Advantage! role.
-
-**?export_mappings**
-- Exports all Twitch-Discord user mappings to a CSV file.
-- Admin-only: requires Roll With Advantage! role.
-
-**?import_mappings**
-- Imports Twitch-Discord mappings from an attached CSV file.
-- Admin-only: requires Roll With Advantage! role.
-"""
-    embed.add_field(name="Admin Commands", value=admin_commands, inline=False)
+    embed.add_field(
+        name="Admin Commands", 
+        value="Commands for server administrators", 
+        inline=True
+    )
     
     embed.set_footer(text="Royal Scribe | Roll With Advantage")
-    await ctx.send(embed=embed)
+    
+    view = HelpView()
+    await ctx.send(embed=embed, view=view)
 
 # ------------------------------------------------------------
 # 7) ROLE UPDATE LOGIC (CALLED AUTOMATICALLY AND MANUALLY)
@@ -843,81 +869,85 @@ async def update_roles(ctx):
 # ------------------------------------------------------------
 # 8) REACTION ROLE COMMANDS AND EVENTS
 # ------------------------------------------------------------
-@bot.command()
-@commands.has_role("Roll With Advantage!")
-async def create_reaction_role(ctx, message_id: int, emoji: str, role: discord.Role):
-    """
-    Creates a new reaction role on an existing message:
-    ?create_reaction_role 123456789 👍 @SomeRole
-    """
-    try:
-        # Get the message
-        message = await ctx.channel.fetch_message(message_id)
+class RoleSelectView(View):
+    def __init__(self, roles_dict):
+        super().__init__(timeout=None)  # No timeout for role selection
+        self.add_item(RoleSelect(roles_dict))
+
+class RoleSelect(discord.ui.Select):
+    def __init__(self, roles_dict):
+        options = []
+        for emoji, role_name in roles_dict.items():
+            options.append(discord.SelectOption(
+                label=role_name,
+                description=f"Get the {role_name} role",
+                emoji=emoji,
+                value=role_name
+            ))
         
-        # Add the reaction to the message
-        await message.add_reaction(emoji)
+        super().__init__(
+            placeholder="Select roles to toggle...",
+            min_values=1,
+            max_values=1,  # Let them select one at a time for clarity
+            options=options,
+            custom_id="role_select"
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        # Get the selected role name
+        selected_role_name = self.values[0]
         
-        # Save to database
-        if save_reaction_role(message_id, emoji, role.id):
-            embed = discord.Embed(
-                title="Reaction Role Created",
-                description=f"React with {emoji} to get the {role.name} role.",
-                color=discord.Color.green()
+        # Find the role in the server
+        role = discord.utils.get(interaction.guild.roles, name=selected_role_name)
+        
+        if not role:
+            await interaction.response.send_message(
+                f"Error: Role '{selected_role_name}' not found.", 
+                ephemeral=True
             )
-            await ctx.send(embed=embed)
+            return
+        
+        # Toggle the role
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(
+                f"❌ Removed role: {role.name}", 
+                ephemeral=True
+            )
         else:
-            embed = discord.Embed(
-                title="Error",
-                description="Failed to save reaction role to database.",
-                color=discord.Color.red()
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(
+                f"✅ Added role: {role.name}", 
+                ephemeral=True
             )
-            await ctx.send(embed=embed)
-    except discord.NotFound:
-        await ctx.send("❌ Message not found. Make sure you're using the right message ID.")
-    except Exception as e:
-        await ctx.send(f"❌ Error: {str(e)}")
 
 @bot.command()
 @commands.has_role("Roll With Advantage!")
-async def create_role_message(ctx, *, title="React to get roles!"):
-    """
-    Creates a new message with pre-defined reaction roles:
-    ?create_role_message Choose your roles
-    """
-    # Create embed for reaction roles
+async def create_role_message(ctx, *, title="Select your roles"):
+    """Creates a new message with a dropdown menu for role selection."""
     embed = discord.Embed(
         title=title,
-        description="React to get roles:",
+        description="Use the dropdown menu below to add or remove roles:",
         color=discord.Color.blue()
     )
     
     for emoji, role_name in REACTION_ROLES.items():
-        embed.add_field(name=f"{emoji} {role_name}", value="React to get this role.", inline=False)
+        embed.add_field(name=f"{emoji} {role_name}", 
+                      value="Select to toggle this role", 
+                      inline=True)
     
     embed.set_footer(text="Royal Scribe | Roll With Advantage")
     
-    # Send the message
-    message = await ctx.send(embed=embed)
+    view = RoleSelectView(REACTION_ROLES)
+    await ctx.send(embed=embed, view=view)
     
-    # Add reactions and save to database
-    for emoji in REACTION_ROLES.keys():
-        await message.add_reaction(emoji)
-        
-        # Find role ID
-        role = discord.utils.get(ctx.guild.roles, name=REACTION_ROLES[emoji])
-        if role:
-            # Save to database
-            save_reaction_role(message.id, emoji, role.id)
-        else:
-            await ctx.send(f"⚠️ Warning: Role '{REACTION_ROLES[emoji]}' not found in server.")
-    
-    # Send success message once after all reactions are added
-    success_embed = discord.Embed(
-        title="✅ Role Message Created",
-        description="The reaction role menu has been set up successfully!",
+    # Confirmation message
+    confirm_embed = discord.Embed(
+        title="✅ Role Menu Created",
+        description="The role selection menu has been set up successfully!",
         color=discord.Color.green()
     )
-    await ctx.send(embed=success_embed, delete_after=5.0)  # Auto-delete after 5 seconds
+    await ctx.send(embed=confirm_embed, delete_after=5.0)
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -1024,11 +1054,130 @@ async def on_command_error(ctx, error):
 # 11) RUN THE BOT
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # Attempt to create database tables before starting the bot
-    create_tables_if_not_exist()
+    # Check for existing instance using file locking
+    import sys
+    import fcntl  # For Linux/Unix
     
-    # Run the bot with error handling
     try:
-        bot.run(TOKEN)
-    except Exception as e:
-        logger.critical(f"Bot crashed: {e}")
+        # Try to create and lock a file
+        lock_file = open("trivia_bot.lock", "w")
+        
+        try:
+            # For Windows
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            is_locked = True
+        except ImportError:
+            # For Unix/Linux
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                is_locked = True
+            except IOError:
+                is_locked = False
+        
+        if not is_locked:
+            logger.critical("Another instance of the bot is already running! Exiting.")
+            sys.exit(1)
+            
+        logger.info("No other instances detected. Starting bot...")
+        
+        # Attempt to create database tables before starting the bot
+        create_tables_if_not_exist()
+        
+        # Run the bot with error handling
+        try:
+            bot.run(TOKEN)
+        except Exception as e:
+            logger.critical(f"Bot crashed: {e}")
+            
+    except IOError:
+        logger.critical("Could not create lock file. Another instance may be running.")
+        sys.exit(1)
+
+# ------------------------------------------------------------
+# 12) LINK TWITCH UI
+# ------------------------------------------------------------
+class LinkTwitchModal(Modal, title="Link Twitch Account"):
+    def __init__(self, member):
+        super().__init__()
+        self.member = member
+        
+        self.twitch_username = TextInput(
+            label="Twitch Username",
+            placeholder="Enter the Twitch username...",
+            required=True,
+            max_length=50
+        )
+        
+        self.add_item(self.twitch_username)
+    
+    async def on_submit(self, interaction):
+        twitch_name = self.twitch_username.value
+        success = map_twitch_to_discord(twitch_name, str(self.member.id))
+        
+        if success:
+            embed = discord.Embed(
+                title="User Linked",
+                description=f"Successfully linked {self.member.mention} to Twitch username '{twitch_name}'",
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="Error",
+                description="Failed to link user. Database error.",
+                color=discord.Color.red()
+            )
+        
+        await interaction.response.send_message(embed=embed)
+
+class LinkTwitchView(View):
+    def __init__(self, ctx):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+    
+    @discord.ui.button(label="Link Twitch Account", style=discord.ButtonStyle.primary)
+    async def link_twitch_button(self, interaction, button):
+        # Check if user has admin role
+        if not any(role.name == "Roll With Advantage!" for role in interaction.user.roles):
+            await interaction.response.send_message("You don't have permission to use this feature.", ephemeral=True)
+            return
+        
+        # Create select menu for member selection
+        options = []
+        for member in interaction.guild.members:
+            if not member.bot:
+                options.append(discord.SelectOption(
+                    label=member.display_name,
+                    description=f"ID: {member.id}",
+                    value=str(member.id)
+                ))
+        
+        # Create a new view with member select
+        select_view = View()
+        select = Select(
+            placeholder="Select a member to link...",
+            options=options[:25],  # Discord limits to 25 options
+            custom_id="member_select"
+        )
+        
+        async def select_callback(interaction):
+            member_id = select.values[0]
+            member = interaction.guild.get_member(int(member_id))
+            
+            if member:
+                modal = LinkTwitchModal(member)
+                await interaction.response.send_modal(modal)
+            else:
+                await interaction.response.send_message("Member not found.", ephemeral=True)
+        
+        select.callback = select_callback
+        select_view.add_item(select)
+        
+        await interaction.response.send_message("Select a member to link:", view=select_view, ephemeral=True)
+
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def link_twitch_ui(ctx):
+    """Opens an interactive UI for linking Discord users to Twitch usernames."""
+    view = LinkTwitchView(ctx)
+    await ctx.send("Click the button below to link a Discord user to a Twitch username:", view=view)
