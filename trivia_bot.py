@@ -65,7 +65,7 @@ REACTION_ROLES = {
 BOT_DESCRIPTION = "Royal Scribe - The official bot for Roll With Advantage"
 
 # YouTube Configuration
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCaV1N7z-Y7bo_F3W8_-U95A")  # Default is RWA channel
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCjoM3DM9R1dCqMBtFcDhMsw")  # Default is RWA channel
 YOUTUBE_CHECK_INTERVAL = 30  # Check every 30 minutes
 YOUTUBE_NOTIFICATION_CHANNEL_ID = 747249434542473218
 YOUTUBE_VIEWER_ROLE_ID = 1358892978789421151
@@ -922,7 +922,9 @@ class HelpView(View):
             "?export_mappings": "Exports all Twitch-Discord user mappings to a CSV file.",
             "?import_mappings": "Imports Twitch-Discord mappings from an attached CSV file.",
             "?link_twitch_ui": "Opens an interactive UI for linking Discord users to Twitch usernames.",
-            "?take_snapshot": "Takes a snapshot of current scores for session tracking."
+            "?take_snapshot": "Takes a snapshot of current scores for session tracking.",
+            "?check_youtube": "Manually checks for new YouTube videos and displays the latest video information."
+
         }
         
         for cmd, desc in commands.items():
@@ -1312,6 +1314,31 @@ async def check_youtube(ctx):
     except Exception as e:
         await ctx.send(f"Error checking YouTube: {str(e)}")
 
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def test_feed(ctx):
+    """Test the YouTube RSS feed parser directly."""
+    await ctx.send("Testing YouTube RSS feed...")
+    
+    try:
+        rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+        feed = feedparser.parse(rss_url, timeout=10)
+        
+        if feed.entries:
+            await ctx.send(f"Feed parsed successfully! Found {len(feed.entries)} videos.")
+            
+            # Get details of first entry for debugging
+            first = feed.entries[0]
+            debug_info = f"First video:\n"
+            debug_info += f"Available attributes: {', '.join(dir(first)[:20])}...\n"
+            debug_info += f"Feed version: {feed.version}\n"
+            
+            await ctx.send(debug_info)
+        else:
+            await ctx.send("Feed parsed but no entries found.")
+    except Exception as e:
+        await ctx.send(f"Error testing feed: {str(e)}")
+
 # ------------------------------------------------------------
 # 10) ERROR HANDLING
 # ------------------------------------------------------------
@@ -1462,15 +1489,30 @@ def save_last_video_id(video_id):
 def get_latest_youtube_video():
     """Get the latest YouTube video information from the channel's RSS feed."""
     try:
+        logger.info(f"Fetching YouTube RSS feed for channel: {YOUTUBE_CHANNEL_ID}")
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
-        feed = feedparser.parse(rss_url)
+        
+        # Add timeout to prevent hanging
+        feed = feedparser.parse(rss_url, timeout=10)
+        
+        logger.info(f"Feed entries found: {len(feed.entries)}")
         
         if feed.entries:
             latest_video = feed.entries[0]
-            video_id = latest_video.yt_videoid
-            video_title = latest_video.title
-            video_url = latest_video.link
-            video_published = latest_video.published
+            
+            # Check if required attributes exist
+            if not hasattr(latest_video, 'yt_videoid'):
+                # Try alternative attribute names or extraction methods
+                video_id = latest_video.id.split(':')[-1] if hasattr(latest_video, 'id') else None
+                logger.warning(f"yt_videoid attribute missing, extracted: {video_id}")
+            else:
+                video_id = latest_video.yt_videoid
+                
+            video_title = latest_video.title if hasattr(latest_video, 'title') else "Unknown Title"
+            video_url = latest_video.link if hasattr(latest_video, 'link') else f"https://www.youtube.com/watch?v={video_id}"
+            video_published = latest_video.published if hasattr(latest_video, 'published') else "Unknown Date"
+            
+            logger.info(f"Successfully fetched video: {video_title} ({video_id})")
             
             return {
                 'id': video_id,
@@ -1478,9 +1520,11 @@ def get_latest_youtube_video():
                 'url': video_url,
                 'published': video_published
             }
-        return None
+        else:
+            logger.warning("No entries found in YouTube RSS feed")
+            return None
     except Exception as e:
-        logger.error(f"Error fetching YouTube RSS: {e}")
+        logger.error(f"Error fetching YouTube RSS: {e}", exc_info=True)
         return None
 
 # ------------------------------------------------------------
