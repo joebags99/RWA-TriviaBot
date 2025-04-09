@@ -12,6 +12,8 @@ import json
 import pymysql
 import pymysql.cursors
 from dotenv import load_dotenv
+import feedparser  # Add this for YouTube RSS feed parsing
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -61,6 +63,13 @@ REACTION_ROLES = {
 
 # Bot description
 BOT_DESCRIPTION = "Royal Scribe - The official bot for Roll With Advantage"
+
+# YouTube Configuration
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCaV1N7z-Y7bo_F3W8_-U95A")  # Default is RWA channel
+YOUTUBE_CHECK_INTERVAL = 30  # Check every 30 minutes
+YOUTUBE_NOTIFICATION_CHANNEL_ID = 747249434542473218
+YOUTUBE_VIEWER_ROLE_ID = 1358892978789421151
+LAST_VIDEO_ID_FILE = "last_video_id.txt"
 
 # ------------------------------------------------------------
 # 2) DISCORD INTENTS AND BOT SETUP
@@ -117,10 +126,13 @@ def execute_db_query(query, params=None, fetch=True, commit=True):
     result = None
     try:
         with connection.cursor() as cursor:
-            cursor.execute(query, params)
+            affected_rows = cursor.execute(query, params)
             
             if fetch:
                 result = cursor.fetchall()
+            else:
+                # Return affected rows for non-fetch operations
+                result = affected_rows
             
         if commit:
             connection.commit()
@@ -472,6 +484,11 @@ async def on_ready():
     # Start your scheduled tasks if not already running
     if not schedule_weekly_update.is_running():
         schedule_weekly_update.start()
+        
+    # Start YouTube checker task
+    if not check_youtube_videos.is_running():
+        check_youtube_videos.start()
+        logger.info("YouTube notification checker started")
 
 # ------------------------------------------------------------
 # 6) LEADERBOARD AND USER COMMANDS
@@ -484,7 +501,7 @@ class LeaderboardView(View):
         self.page = page
         self.page_size = page_size
         self.custom_score_column = score_column  # Allow custom score column
-        self.max_pages = max(1, (len(scores_df) + page_size - 1) // page_size)
+        self.max_pages = max(1, (len(self.scores_df) + self.page_size - 1) // self.page_size)
         self.update_buttons()
     
     def update_buttons(self):
@@ -1217,6 +1234,84 @@ async def schedule_weekly_update():
             )
             await channel.send(embed=embed)
 
+@tasks.loop(minutes=YOUTUBE_CHECK_INTERVAL)
+async def check_youtube_videos():
+    """Periodically check for new YouTube videos and send notifications."""
+    logger.info("Checking for new YouTube videos...")
+    
+    try:
+        latest_video = get_latest_youtube_video()
+        last_video_id = get_last_video_id()
+        
+        if not latest_video:
+            logger.warning("Could not fetch latest YouTube video information")
+            return
+        
+        # If this is a new video (or first run with no saved ID)
+        if latest_video['id'] != last_video_id:
+            logger.info(f"New YouTube video detected: {latest_video['title']}")
+            
+            # Get the notification channel
+            channel = bot.get_channel(YOUTUBE_NOTIFICATION_CHANNEL_ID)
+            if not channel:
+                logger.error(f"YouTube notification channel not found: {YOUTUBE_NOTIFICATION_CHANNEL_ID}")
+                return
+            
+            # Create embed for the video
+            embed = discord.Embed(
+                title=latest_video['title'],
+                url=latest_video['url'],
+                description="New video from Roll With Advantage!",
+                color=discord.Color.red()
+            )
+            embed.set_thumbnail(url=f"https://img.youtube.com/vi/{latest_video['id']}/maxresdefault.jpg")
+            embed.add_field(name="Published", value=latest_video['published'], inline=False)
+            embed.set_footer(text="Royal Scribe | Roll With Advantage")
+            
+            # Send notification with role mention
+            await channel.send(
+                f"Roll With Advantage has posted a new video, check it out! <@&{YOUTUBE_VIEWER_ROLE_ID}>",
+                embed=embed
+            )
+            
+            # Save the new video ID
+            save_last_video_id(latest_video['id'])
+        
+    except Exception as e:
+        logger.error(f"Error in YouTube notification task: {e}")
+
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def check_youtube(ctx):
+    """Manually check for new YouTube videos."""
+    await ctx.send("Checking for new YouTube videos...")
+    
+    try:
+        latest_video = get_latest_youtube_video()
+        last_video_id = get_last_video_id()
+        
+        if not latest_video:
+            await ctx.send("Could not fetch YouTube video information.")
+            return
+        
+        # Create embed with video info for preview
+        embed = discord.Embed(
+            title=latest_video['title'],
+            url=latest_video['url'],
+            description="Latest video from Roll With Advantage",
+            color=discord.Color.red()
+        )
+        embed.set_thumbnail(url=f"https://img.youtube.com/vi/{latest_video['id']}/maxresdefault.jpg")
+        embed.add_field(name="Published", value=latest_video['published'], inline=False)
+        embed.add_field(name="Video ID", value=latest_video['id'], inline=False)
+        embed.add_field(name="Last Notified ID", value=last_video_id or "None", inline=False)
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"Error checking YouTube: {str(e)}")
+
 # ------------------------------------------------------------
 # 10) ERROR HANDLING
 # ------------------------------------------------------------
@@ -1341,7 +1436,55 @@ async def link_twitch_ui(ctx):
     await ctx.send("Click the button below to link a Discord user to a Twitch username:", view=view)
 
 # ------------------------------------------------------------
-# 12) RUN THE BOT
+# 12) YOUTUBE NOTIFICATION FUNCTIONS
+# ------------------------------------------------------------
+def get_last_video_id():
+    """Get the ID of the last notified YouTube video."""
+    try:
+        if os.path.exists(LAST_VIDEO_ID_FILE):
+            with open(LAST_VIDEO_ID_FILE, 'r') as f:
+                return f.read().strip()
+        return None
+    except Exception as e:
+        logger.error(f"Error reading last video ID: {e}")
+        return None
+
+def save_last_video_id(video_id):
+    """Save the ID of the last notified YouTube video."""
+    try:
+        with open(LAST_VIDEO_ID_FILE, 'w') as f:
+            f.write(video_id)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving last video ID: {e}")
+        return False
+
+def get_latest_youtube_video():
+    """Get the latest YouTube video information from the channel's RSS feed."""
+    try:
+        rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+        feed = feedparser.parse(rss_url)
+        
+        if feed.entries:
+            latest_video = feed.entries[0]
+            video_id = latest_video.yt_videoid
+            video_title = latest_video.title
+            video_url = latest_video.link
+            video_published = latest_video.published
+            
+            return {
+                'id': video_id,
+                'title': video_title,
+                'url': video_url,
+                'published': video_published
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching YouTube RSS: {e}")
+        return None
+
+# ------------------------------------------------------------
+# 13) RUN THE BOT
 # ------------------------------------------------------------
 if __name__ == "__main__":
     # Check for existing instance using file locking
