@@ -561,6 +561,25 @@ class LeaderboardView(View):
         button.label = "Show Weekly Scores" if self.is_total else "Show All-Time Scores"
         self.page = 0
         
+        # Get the appropriate data based on toggle state
+        if self.is_total:
+            # Get all-time scores
+            scores_df = get_scores_from_external_db()
+            if not scores_df.empty:
+                self.scores_df = scores_df.sort_values(by='Score', ascending=False)
+        else:
+            # Get weekly/recent scores
+            scores_df = get_scores_from_external_db()
+            if not scores_df.empty and 'RecentDate' in scores_df.columns:
+                # Add date-only column for filtering
+                scores_df['DateOnly'] = pd.to_datetime(scores_df['RecentDate']).dt.date
+                most_recent_date = scores_df['DateOnly'].max()
+                self.scores_df = scores_df[scores_df['DateOnly'] == most_recent_date].sort_values(by='Score', ascending=False)
+        
+        # Update pagination based on new data
+        self.max_pages = max(1, (len(self.scores_df) + self.page_size - 1) // self.page_size)
+        logger.info(f"Toggle button: switched to {'all-time' if self.is_total else 'weekly'}, {len(self.scores_df)} scores, {self.max_pages} pages")
+        
         # Update navigation buttons
         self.prev_button.disabled = True
         self.next_button.disabled = (self.max_pages <= 1)
@@ -586,12 +605,31 @@ class LeaderboardView(View):
         # Get date if available for weekly view
         if not self.is_total and 'RecentDate' in self.scores_df.columns:
             most_recent_date = self.scores_df['RecentDate'].max()
-            description = f"Top scores as of {most_recent_date}"
+            # Format date in a more readable way (day/month/year)
+            if isinstance(most_recent_date, pd.Timestamp):
+                formatted_date = most_recent_date.strftime('%d %b %Y')  # Example: "06 Apr 2025"
+            else:
+                # Handle string dates
+                try:
+                    formatted_date = pd.to_datetime(most_recent_date).strftime('%d %b %Y')
+                except:
+                    formatted_date = str(most_recent_date)
+            
+            description = f"Top scores as of {formatted_date}"
         
-        # Add snapshot date if available
+        # Add snapshot date if available (also format this date)
         if 'SnapshotDate' in self.scores_df.columns and not self.scores_df.empty:
             snapshot_date = self.scores_df['SnapshotDate'].iloc[0]
-            description = f"{description} (since {snapshot_date})"
+            # Format snapshot date
+            if isinstance(snapshot_date, pd.Timestamp):
+                formatted_snapshot = snapshot_date.strftime('%d %b %Y')
+            else:
+                try:
+                    formatted_snapshot = pd.to_datetime(snapshot_date).strftime('%d %b %Y')
+                except:
+                    formatted_snapshot = str(snapshot_date)
+                    
+            description = f"{description} (since {formatted_snapshot})"
         
         embed = discord.Embed(title=title, description=description, color=color)
         
