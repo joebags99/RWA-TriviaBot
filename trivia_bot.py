@@ -509,90 +509,65 @@ async def on_ready():
 # ------------------------------------------------------------
 class LeaderboardView(View):
     def __init__(self, scores_df, is_total=False, page=0, page_size=10, score_column=None):
-        super().__init__(timeout=600)  # Increase timeout to 10 minutes
+        super().__init__(timeout=600)
         self.scores_df = scores_df
         self.is_total = is_total
         self.page = page
         self.page_size = page_size
-        self.custom_score_column = score_column  # Allow custom score column
+        self.custom_score_column = score_column
         self.max_pages = max(1, (len(self.scores_df) + self.page_size - 1) // self.page_size)
-        logger.info(f"LeaderboardView created with {len(scores_df)} scores, {self.max_pages} pages")
-        self.update_buttons()
-    
-    def update_buttons(self):
-        self.clear_items()
-        
-        # Previous page button
-        prev_button = Button(
-            label="◀️ Previous", 
-            style=discord.ButtonStyle.primary, 
-            disabled=(self.page <= 0),
-            custom_id="prev_page"
-        )
-        prev_button.callback = self.previous_page
-        self.add_item(prev_button)
-        
-        # Page indicator
-        page_indicator = Button(
-            label=f"Page {self.page + 1}/{self.max_pages}", 
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-            custom_id="page_indicator"
-        )
-        self.add_item(page_indicator)
-        
-        # Next page button
-        next_button = Button(
-            label="Next ▶️", 
-            style=discord.ButtonStyle.primary,
-            disabled=(self.page >= self.max_pages - 1),
-            custom_id="next_page"
-        )
-        next_button.callback = self.next_page
-        self.add_item(next_button)
-        
-        # Toggle button
-        toggle_label = "Show Weekly Scores" if self.is_total else "Show All-Time Scores"
-        toggle_button = Button(
-            label=toggle_label,
-            style=discord.ButtonStyle.success,
-            custom_id="toggle_view"
-        )
-        toggle_button.callback = self.toggle_view
-        self.add_item(toggle_button)
-    
-    async def previous_page(self, interaction):
+        logger.info(f"LeaderboardView: {len(scores_df)} scores, {self.max_pages} pages")
+
+    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.primary, row=0)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info("Previous button clicked")
         if self.page > 0:
             self.page -= 1
-            self.update_buttons()
+            # Update button states
+            self.prev_button.disabled = (self.page <= 0)
+            self.next_button.disabled = (self.page >= self.max_pages - 1)
+            self.page_indicator.label = f"Page {self.page + 1}/{self.max_pages}"
+            
             await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            logger.info(f"Moved to previous page: {self.page+1}/{self.max_pages}")
         else:
             await interaction.response.defer()
-    
-    async def next_page(self, interaction):
-        try:
-            logger.info(f"Next page button clicked. Current page: {self.page}, Max pages: {self.max_pages}")
-            if self.page < self.max_pages - 1:
-                self.page += 1
-                self.update_buttons()
-                await interaction.response.edit_message(embed=self.get_embed(), view=self)
-                logger.info(f"Moved to page {self.page}")
-            else:
-                logger.warning(f"Cannot go to next page: already at max page ({self.page}/{self.max_pages-1})")
-                await interaction.response.defer()
-        except Exception as e:
-            logger.error(f"Error handling next page button: {e}")
-            try:
-                await interaction.response.send_message("An error occurred changing pages.", ephemeral=True)
-            except:
-                pass
-    
-    async def toggle_view(self, interaction):
+            logger.info("Previous button: Already at first page")
+
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+    async def page_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # This button is just a label and doesn't do anything
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary, row=0)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info(f"Next button clicked. Page: {self.page+1}/{self.max_pages}")
+        if self.page < self.max_pages - 1:
+            self.page += 1
+            # Update button states
+            self.prev_button.disabled = (self.page <= 0)
+            self.next_button.disabled = (self.page >= self.max_pages - 1)
+            self.page_indicator.label = f"Page {self.page + 1}/{self.max_pages}"
+            
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            logger.info(f"Moved to next page: {self.page+1}/{self.max_pages}")
+        else:
+            await interaction.response.defer()
+            logger.info("Next button: Already at last page")
+
+    @discord.ui.button(label="Show All-Time Scores", style=discord.ButtonStyle.success, row=1)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.is_total = not self.is_total
-        self.page = 0  # Reset to first page
-        self.update_buttons()
+        button.label = "Show Weekly Scores" if self.is_total else "Show All-Time Scores"
+        self.page = 0
+        
+        # Update navigation buttons
+        self.prev_button.disabled = True
+        self.next_button.disabled = (self.max_pages <= 1)
+        self.page_indicator.label = f"Page {self.page + 1}/{self.max_pages}"
+        
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
-    
+
     def get_embed(self):
         start_idx = self.page * self.page_size
         end_idx = min(start_idx + self.page_size, len(self.scores_df))
