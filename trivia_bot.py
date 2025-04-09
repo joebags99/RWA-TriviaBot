@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import discord
+print(f"Discord.py version: {discord.__version__}")
 from discord.ext import commands, tasks
 from discord.ui import Button, View, Select, Modal, TextInput
 import logging
