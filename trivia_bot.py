@@ -509,13 +509,14 @@ async def on_ready():
 # ------------------------------------------------------------
 class LeaderboardView(View):
     def __init__(self, scores_df, is_total=False, page=0, page_size=10, score_column=None):
-        super().__init__(timeout=180)  # 3 minute timeout
+        super().__init__(timeout=600)  # Increase timeout to 10 minutes
         self.scores_df = scores_df
         self.is_total = is_total
         self.page = page
         self.page_size = page_size
         self.custom_score_column = score_column  # Allow custom score column
         self.max_pages = max(1, (len(self.scores_df) + self.page_size - 1) // self.page_size)
+        logger.info(f"LeaderboardView created with {len(scores_df)} scores, {self.max_pages} pages")
         self.update_buttons()
     
     def update_buttons(self):
@@ -569,12 +570,22 @@ class LeaderboardView(View):
             await interaction.response.defer()
     
     async def next_page(self, interaction):
-        if self.page < self.max_pages - 1:
-            self.page += 1
-            self.update_buttons()
-            await interaction.response.edit_message(embed=self.get_embed(), view=self)
-        else:
-            await interaction.response.defer()
+        try:
+            logger.info(f"Next page button clicked. Current page: {self.page}, Max pages: {self.max_pages}")
+            if self.page < self.max_pages - 1:
+                self.page += 1
+                self.update_buttons()
+                await interaction.response.edit_message(embed=self.get_embed(), view=self)
+                logger.info(f"Moved to page {self.page}")
+            else:
+                logger.warning(f"Cannot go to next page: already at max page ({self.page}/{self.max_pages-1})")
+                await interaction.response.defer()
+        except Exception as e:
+            logger.error(f"Error handling next page button: {e}")
+            try:
+                await interaction.response.send_message("An error occurred changing pages.", ephemeral=True)
+            except:
+                pass
     
     async def toggle_view(self, interaction):
         self.is_total = not self.is_total
