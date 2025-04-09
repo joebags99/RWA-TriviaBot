@@ -71,6 +71,15 @@ YOUTUBE_NOTIFICATION_CHANNEL_ID = 747249434542473218
 YOUTUBE_VIEWER_ROLE_ID = 1358892978789421151
 LAST_VIDEO_ID_FILE = "last_video_id.txt"
 
+# Twitch API Configuration
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+TWITCH_CHANNELS = os.getenv("TWITCH_CHANNELS", "rollwithadvantage").split(",")  # Comma-separated list of channels to track
+TWITCH_CHECK_INTERVAL = 5  # Check every 5 minutes
+TWITCH_NOTIFICATION_CHANNEL_ID = int(os.getenv("TWITCH_NOTIFICATION_CHANNEL_ID", "747249434542473218"))
+TWITCH_VIEWER_ROLE_ID = int(os.getenv("TWITCH_VIEWER_ROLE_ID", "1358892810559819777"))  # Replace with your role ID
+TWITCH_LIVE_STATUS_FILE = "twitch_live_status.json"
+
 # ------------------------------------------------------------
 # 2) DISCORD INTENTS AND BOT SETUP
 # ------------------------------------------------------------
@@ -489,6 +498,11 @@ async def on_ready():
     if not check_youtube_videos.is_running():
         check_youtube_videos.start()
         logger.info("YouTube notification checker started")
+
+    # Start Twitch monitoring task
+    if not check_twitch_streams.is_running():
+        check_twitch_streams.start()
+        logger.info("Twitch stream monitoring started")
 
 # ------------------------------------------------------------
 # 6) LEADERBOARD AND USER COMMANDS
@@ -923,8 +937,9 @@ class HelpView(View):
             "?import_mappings": "Imports Twitch-Discord mappings from an attached CSV file.",
             "?link_twitch_ui": "Opens an interactive UI for linking Discord users to Twitch usernames.",
             "?take_snapshot": "Takes a snapshot of current scores for session tracking.",
-            "?check_youtube": "Manually checks for new YouTube videos and displays the latest video information."
-
+            "?check_youtube": "Manually checks for new YouTube videos and displays the latest video information.",
+            "?twitch_status [ChannelName]": "Checks if a Twitch channel is currently live.",
+            "?start_twitch_monitoring": "Manually starts Twitch stream monitoring."
         }
         
         for cmd, desc in commands.items():
@@ -1343,6 +1358,83 @@ async def test_feed(ctx):
     except Exception as e:
         await ctx.send(f"Error testing feed: {str(e)}")
 
+@tasks.loop(minutes=TWITCH_CHECK_INTERVAL)
+async def check_twitch_streams():
+    """Periodically check for Twitch streams going live or offline."""
+    logger.info("Checking Twitch stream status...")
+    
+    # Load previous status
+    previous_status = load_live_status()
+    current_status = {}
+    
+    for channel in TWITCH_CHANNELS:
+        try:
+            stream_data = get_stream_status(channel)
+            
+            if not stream_data:
+                logger.warning(f"Could not fetch Twitch stream data for {channel}")
+                continue
+            
+            current_status[channel] = stream_data
+            was_live = previous_status.get(channel, {}).get('is_live', False)
+            now_live = stream_data.get('is_live', False)
+            
+            # Stream just went live
+            if now_live and not was_live:
+                logger.info(f"Twitch channel {channel} went live!")
+                await send_stream_notification(channel, stream_data)
+            
+            # Stream just went offline
+            elif was_live and not now_live:
+                logger.info(f"Twitch channel {channel} went offline")
+                # Optionally handle stream ended notifications
+        
+        except Exception as e:
+            logger.error(f"Error processing Twitch channel {channel}: {e}")
+    
+    # Save current status
+    save_live_status(current_status)
+
+async def send_stream_notification(channel_name, stream_data):
+    """Send a notification when a Twitch stream goes live."""
+    notification_channel = bot.get_channel(TWITCH_NOTIFICATION_CHANNEL_ID)
+    if not notification_channel:
+        logger.error(f"Twitch notification channel not found: {TWITCH_NOTIFICATION_CHANNEL_ID}")
+        return
+    
+    # Get channel info for profile image
+    channel_info = get_channel_info(channel_name)
+    profile_url = channel_info.get('profile_image_url') if channel_info else None
+    
+    # Create embed
+    embed = discord.Embed(
+        title=stream_data.get('title', f"{channel_name} is now live!"),
+        url=f"https://twitch.tv/{channel_name}",
+        description=f"Playing {stream_data.get('game_name', 'something awesome')}",
+        color=0x6441A4  # Twitch purple
+    )
+    
+    if profile_url:
+        embed.set_author(name=f"{channel_name} is now live!", icon_url=profile_url)
+    
+    if stream_data.get('thumbnail_url'):
+        embed.set_image(url=f"{stream_data.get('thumbnail_url')}?t={int(time.time())}")
+    
+    embed.add_field(name="Viewers", value=stream_data.get('viewer_count', 0), inline=True)
+    embed.set_footer(text="Royal Scribe | Roll With Advantage")
+    
+    # Send notification with role mention
+    if TWITCH_VIEWER_ROLE_ID:
+        await notification_channel.send(
+            f"**{channel_name}** is now live on Twitch! <@&{TWITCH_VIEWER_ROLE_ID}>",
+            embed=embed
+        )
+    else:
+        await notification_channel.send(
+            f"**{channel_name}** is now live on Twitch!",
+            embed=embed
+        )
+
 # ------------------------------------------------------------
 # 10) ERROR HANDLING
 # ------------------------------------------------------------
@@ -1467,7 +1559,120 @@ async def link_twitch_ui(ctx):
     await ctx.send("Click the button below to link a Discord user to a Twitch username:", view=view)
 
 # ------------------------------------------------------------
-# 12) YOUTUBE NOTIFICATION FUNCTIONS
+# 12) TWITCH API INTEGRATION
+# ------------------------------------------------------------
+def get_twitch_access_token():
+    """Get OAuth access token from Twitch API."""
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        logger.error("Twitch API credentials not configured")
+        return None
+    
+    try:
+        url = "https://id.twitch.tv/oauth2/token"
+        payload = {
+            'client_id': TWITCH_CLIENT_ID,
+            'client_secret': TWITCH_CLIENT_SECRET,
+            'grant_type': 'client_credentials'
+        }
+        
+        response = requests.post(url, data=payload)
+        response.raise_for_status()
+        
+        data = response.json()
+        return data.get('access_token')
+    except Exception as e:
+        logger.error(f"Error getting Twitch access token: {e}")
+        return None
+
+def get_stream_status(channel_name):
+    """Check if a Twitch channel is currently streaming."""
+    access_token = get_twitch_access_token()
+    if not access_token:
+        return None
+    
+    try:
+        headers = {
+            'Client-ID': TWITCH_CLIENT_ID,
+            'Authorization': f'Bearer {access_token}'
+        }
+        
+        url = f"https://api.twitch.tv/helix/streams?user_login={channel_name.lower()}"
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        data = response.json()
+        streams = data.get('data', [])
+        
+        if streams and len(streams) > 0:
+            # Stream is live
+            stream_data = streams[0]
+            return {
+                'is_live': True,
+                'title': stream_data.get('title', 'Untitled Stream'),
+                'game_name': stream_data.get('game_name', 'Unknown Game'),
+                'viewer_count': stream_data.get('viewer_count', 0),
+                'started_at': stream_data.get('started_at'),
+                'thumbnail_url': stream_data.get('thumbnail_url', '').replace('{width}', '1280').replace('{height}', '720'),
+                'user_name': stream_data.get('user_name', channel_name)
+            }
+        else:
+            # Stream is offline
+            return {'is_live': False}
+    except Exception as e:
+        logger.error(f"Error checking Twitch stream status: {e}")
+        return None
+
+def get_channel_info(channel_name):
+    """Get detailed info about a Twitch channel."""
+    access_token = get_twitch_access_token()
+    if not access_token:
+        return None
+    
+    try:
+        headers = {
+            'Client-ID': TWITCH_CLIENT_ID,
+            'Authorization': f'Bearer {access_token}'
+        }
+        
+        url = f"https://api.twitch.tv/helix/users?login={channel_name.lower()}"
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        data = response.json()
+        users = data.get('data', [])
+        
+        if users and len(users) > 0:
+            return users[0]
+        else:
+            logger.warning(f"No channel info found for {channel_name}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting Twitch channel info: {e}")
+        return None
+
+def load_live_status():
+    """Load the saved live status of Twitch channels."""
+    try:
+        if os.path.exists(TWITCH_LIVE_STATUS_FILE):
+            with open(TWITCH_LIVE_STATUS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading Twitch live status: {e}")
+        return {}
+
+def save_live_status(status_dict):
+    """Save the live status of Twitch channels."""
+    try:
+        with open(TWITCH_LIVE_STATUS_FILE, 'w') as f:
+            json.dump(status_dict, f)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving Twitch live status: {e}")
+        return False
+
+# ------------------------------------------------------------
+# 13) YOUTUBE NOTIFICATION FUNCTIONS
 # ------------------------------------------------------------
 def get_last_video_id():
     """Get the ID of the last notified YouTube video."""
@@ -1535,7 +1740,57 @@ def get_latest_youtube_video():
         return None
 
 # ------------------------------------------------------------
-# 13) RUN THE BOT
+# 14) TWITCH STATUS COMMANDS
+# ------------------------------------------------------------
+@bot.command()
+async def twitch_status(ctx, channel_name=None):
+    """Check if a Twitch channel is currently live."""
+    # Use default channel if none provided
+    if not channel_name:
+        if not TWITCH_CHANNELS:
+            await ctx.send("No Twitch channels configured!")
+            return
+        channel_name = TWITCH_CHANNELS[0]
+    
+    await ctx.send(f"Checking stream status for {channel_name}...")
+    
+    stream_data = get_stream_status(channel_name)
+    if not stream_data:
+        await ctx.send(f"Could not fetch stream data for {channel_name}.")
+        return
+    
+    if stream_data.get('is_live', False):
+        # Create embed for live stream
+        embed = discord.Embed(
+            title=stream_data.get('title', f"{channel_name} is live!"),
+            url=f"https://twitch.tv/{channel_name}",
+            description=f"Playing {stream_data.get('game_name', 'something awesome')}",
+            color=0x6441A4  # Twitch purple
+        )
+        
+        if stream_data.get('thumbnail_url'):
+            embed.set_image(url=f"{stream_data.get('thumbnail_url')}?t={int(time.time())}")
+        
+        embed.add_field(name="Viewers", value=stream_data.get('viewer_count', 0), inline=True)
+        embed.add_field(name="Started At", value=stream_data.get('started_at', 'Unknown'), inline=True)
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        
+        await ctx.send(f"**{channel_name}** is currently LIVE!", embed=embed)
+    else:
+        await ctx.send(f"**{channel_name}** is currently offline.")
+
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def start_twitch_monitoring(ctx):
+    """Manually start the Twitch stream monitoring."""
+    if not check_twitch_streams.is_running():
+        check_twitch_streams.start()
+        await ctx.send("✅ Twitch stream monitoring started!")
+    else:
+        await ctx.send("Twitch stream monitoring is already running.")
+
+# ------------------------------------------------------------
+# 15) RUN THE BOT
 # ------------------------------------------------------------
 if __name__ == "__main__":
     # Check for existing instance using file locking
