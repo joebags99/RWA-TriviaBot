@@ -1289,7 +1289,7 @@ async def check_youtube_videos():
             return
         
         # If this is a new video (or first run with no saved ID)
-        if latest_video['id'] != last_video_id:
+        if (latest_video['id'] != last_video_id):
             logger.info(f"New YouTube video detected: {latest_video['title']}")
             
             # Get the notification channel
@@ -1305,13 +1305,15 @@ async def check_youtube_videos():
                 description="New video from Roll With Advantage!",
                 color=discord.Color.red()
             )
-            embed.set_thumbnail(url=f"https://img.youtube.com/vi/{latest_video['id']}/maxresdefault.jpg")
+            # Change from set_thumbnail to set_image for a larger preview
+            embed.set_image(url=f"https://img.youtube.com/vi/{latest_video['id']}/maxresdefault.jpg")
             embed.add_field(name="Published", value=latest_video['published'], inline=False)
             embed.set_footer(text="Royal Scribe | Roll With Advantage")
             
-            # Send notification with role mention
+            # Send notification with role mentions
+            ALL_RWA_UPDATES_ROLE_ID = 1358893357316837498  # "All RWA Updates" role ID
             await channel.send(
-                f"Roll With Advantage has posted a new video, check it out! <@&{YOUTUBE_VIEWER_ROLE_ID}>",
+                f"Roll With Advantage has posted a new video, check it out! <@&{YOUTUBE_VIEWER_ROLE_ID}> <@&{ALL_RWA_UPDATES_ROLE_ID}>",
                 embed=embed
             )
             
@@ -1447,15 +1449,12 @@ async def send_stream_notification(channel_name, stream_data):
     embed.add_field(name="Viewers", value=stream_data.get('viewer_count', 0), inline=True)
     embed.set_footer(text="Royal Scribe | Roll With Advantage")
     
-    # Send notification with role mention
+    # Send notification with role mentions - adding All RWA Updates role
+    ALL_RWA_UPDATES_ROLE_ID = 1358893357316837498  # "All RWA Updates" role ID
+    
     if TWITCH_VIEWER_ROLE_ID:
         await notification_channel.send(
-            f"**{channel_name}** is now live on Twitch! <@&{TWITCH_VIEWER_ROLE_ID}>",
-            embed=embed
-        )
-    else:
-        await notification_channel.send(
-            f"**{channel_name}** is now live on Twitch!",
+            f"**{channel_name}** is now live on Twitch! <@&{TWITCH_VIEWER_ROLE_ID}> <@&{ALL_RWA_UPDATES_ROLE_ID}>",
             embed=embed
         )
 
@@ -1652,7 +1651,8 @@ def get_stream_status(channel_name):
                 'game_name': stream_data.get('game_name', 'Unknown Game'),
                 'viewer_count': stream_data.get('viewer_count', 0),
                 'started_at': stream_data.get('started_at'),
-                'thumbnail_url': stream_data.get('thumbnail_url', '').replace('{width}', '1280').replace('{height}', '720'),
+                # Use larger dimensions for thumbnail
+                'thumbnail_url': stream_data.get('thumbnail_url', '').replace('{width}', '1920').replace('{height}', '1080'),
                 'user_name': stream_data.get('user_name', channel_name)
             }
         else:
