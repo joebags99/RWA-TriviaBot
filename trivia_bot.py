@@ -1737,17 +1737,15 @@ def save_last_video_id(video_id):
         return False
 
 def get_latest_youtube_video():
-    """Get the latest YouTube video information from the channel's RSS feed."""
+    """Get the latest YouTube video information from the channel's RSS feed and filter out Shorts by duration."""
     try:
         logger.info(f"Fetching YouTube RSS feed for channel: {YOUTUBE_CHANNEL_ID}")
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
         
-        # Remove the timeout parameter that's causing errors
         feed = feedparser.parse(rss_url)
-        
         logger.info(f"Feed entries found: {len(feed.entries)}")
         
-        # Find the latest non-Short video
+        # Find the latest non-Short video based on duration
         for entry in feed.entries:
             # Debug info
             logger.info(f"Processing video entry: {entry.title if hasattr(entry, 'title') else 'Unknown'}")
@@ -1763,23 +1761,65 @@ def get_latest_youtube_video():
             video_url = entry.link if hasattr(entry, 'link') else f"https://www.youtube.com/watch?v={video_id}"
             video_published = entry.published if hasattr(entry, 'published') else "Unknown Date"
             
-            # Check if this is a Short by examining the URL
-            is_short = False
+            # Check video duration using YouTube's oEmbed API
+            try:
+                import isodate
+                # Get video details
+                api_url = f"https://www.googleapis.com/youtube/v3/videos?id={video_id}&part=contentDetails&key={os.getenv('YOUTUBE_API_KEY')}"
+                response = requests.get(api_url)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'items' in data and len(data['items']) > 0:
+                        # Get ISO 8601 duration
+                        duration_iso = data['items'][0]['contentDetails']['duration']
+                        # Parse into seconds
+                        duration_seconds = isodate.parse_duration(duration_iso).total_seconds()
+                        
+                        logger.info(f"Video duration: {duration_seconds} seconds for {video_title}")
+                        
+                        # Check if it's a Short (3 minutes or less)
+                        if duration_seconds <= 180:
+                            logger.info(f"Skipping YouTube Short (duration: {duration_seconds}s): {video_title}")
+                            continue
+                            
+                        # If duration > 3 minutes, it's a regular video
+                        logger.info(f"Found regular video: {video_title} ({video_id}), duration: {duration_seconds}s")
+                        return {
+                            'id': video_id,
+                            'title': video_title,
+                            'url': video_url,
+                            'published': video_published,
+                            'duration': duration_seconds,
+                            'is_short': False
+                        }
+            except ImportError:
+                logger.warning("isodate package not available, checking fallback methods")
+            except Exception as e:
+                logger.error(f"Error checking video duration for {video_id}: {e}")
+            
+            # If we can't check duration via API, try fallback methods
+            
+            # Fallback 1: Check URL for /shorts/ pattern
             if "/shorts/" in video_url:
-                is_short = True
-                logger.info(f"Detected YouTube Short: {video_title} ({video_id})")
+                logger.info(f"Detected YouTube Short by URL: {video_title}")
+                continue
+                
+            # Fallback 2: Check title for common shorts indicators
+            if "#shorts" in video_title.lower() or "#short" in video_title.lower():
+                logger.info(f"Detected YouTube Short by title hashtag: {video_title}")
+                continue
             
-            # If this is a regular video (not a Short), return it
-            if not is_short:
-                logger.info(f"Found regular video: {video_title} ({video_id})")
-                return {
-                    'id': video_id,
-                    'title': video_title,
-                    'url': video_url,
-                    'published': video_published,
-                    'is_short': False
-                }
-            
+            # If we can't determine if it's a Short, assume it's a regular video
+            logger.info(f"Assumed regular video (couldn't check duration): {video_title} ({video_id})")
+            return {
+                'id': video_id,
+                'title': video_title,
+                'url': video_url,
+                'published': video_published,
+                'is_short': False
+            }
+        
         # If we only found Shorts or no videos at all
         logger.warning("No regular videos found in YouTube RSS feed")
         return None
@@ -1880,3 +1920,58 @@ if __name__ == "__main__":
     except IOError:
         logger.critical("Could not create lock file. Another instance may be running.")
         sys.exit(1)
+
+@bot.command()
+@commands.has_role("Roll With Advantage!")
+async def notify_video(ctx, video_id: str):
+    """Manually send a notification for a specific YouTube video."""
+    try:
+        # Validate video ID format
+        if len(video_id) != 11 or not video_id.isalnum():
+            await ctx.send("Invalid YouTube video ID. It should be an 11-character alphanumeric string.")
+            return
+        
+        # Create video information
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Try to get video title from oEmbed
+        try:
+            oembed_url = f"https://www.youtube.com/oembed?url={video_url}&format=json"
+            response = requests.get(oembed_url)
+            if response.status_code == 200:
+                data = response.json()
+                video_title = data.get('title', 'YouTube Video')
+            else:
+                video_title = "YouTube Video"
+        except Exception:
+            video_title = "YouTube Video"
+        
+        # Get the notification channel
+        channel = bot.get_channel(YOUTUBE_NOTIFICATION_CHANNEL_ID)
+        if not channel:
+            await ctx.send(f"YouTube notification channel not found: {YOUTUBE_NOTIFICATION_CHANNEL_ID}")
+            return
+        
+        # Create embed for the video
+        embed = discord.Embed(
+            title=video_title,
+            url=video_url,
+            description="New video from Roll With Advantage!",
+            color=discord.Color.red()
+        )
+        embed.set_image(url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg")
+        embed.set_footer(text="Royal Scribe | Roll With Advantage")
+        
+        # Send notification with role mention
+        ALL_RWA_UPDATES_ROLE_ID = 1358893357316837498
+        await channel.send(
+            f"Roll With Advantage has posted a new video, check it out! <@&{YOUTUBE_VIEWER_ROLE_ID}> <@&{ALL_RWA_UPDATES_ROLE_ID}>",
+            embed=embed
+        )
+        
+        # Update the last video ID
+        save_last_video_id(video_id)
+        
+        await ctx.send("✅ Video notification sent successfully!")
+    except Exception as e:
+        await ctx.send(f"Error sending notification: {str(e)}")
