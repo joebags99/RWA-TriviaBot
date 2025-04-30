@@ -1278,14 +1278,14 @@ async def schedule_weekly_update():
 @tasks.loop(minutes=YOUTUBE_CHECK_INTERVAL)
 async def check_youtube_videos():
     """Periodically check for new YouTube videos and send notifications."""
-    logger.info("Checking for new YouTube videos...")
+    logger.info("Checking for new YouTube videos (excluding Shorts)...")
     
     try:
         latest_video = get_latest_youtube_video()
         last_video_id = get_last_video_id()
         
         if not latest_video:
-            logger.warning("Could not fetch latest YouTube video information")
+            logger.warning("Could not fetch latest YouTube video information or only found Shorts")
             return
         
         # If this is a new video (or first run with no saved ID)
@@ -1327,27 +1327,28 @@ async def check_youtube_videos():
 @commands.has_role("Roll With Advantage!")
 async def check_youtube(ctx):
     """Manually check for new YouTube videos."""
-    await ctx.send("Checking for new YouTube videos...")
+    await ctx.send("Checking for new YouTube videos (excluding Shorts)...")
     
     try:
         latest_video = get_latest_youtube_video()
         last_video_id = get_last_video_id()
         
         if not latest_video:
-            await ctx.send("Could not fetch YouTube video information.")
+            await ctx.send("Could not fetch YouTube video information or only found Shorts.")
             return
         
         # Create embed with video info for preview
         embed = discord.Embed(
             title=latest_video['title'],
             url=latest_video['url'],
-            description="Latest video from Roll With Advantage",
+            description="Latest regular video from Roll With Advantage",
             color=discord.Color.red()
         )
         embed.set_thumbnail(url=f"https://img.youtube.com/vi/{latest_video['id']}/maxresdefault.jpg")
         embed.add_field(name="Published", value=latest_video['published'], inline=False)
         embed.add_field(name="Video ID", value=latest_video['id'], inline=False)
         embed.add_field(name="Last Notified ID", value=last_video_id or "None", inline=False)
+        embed.add_field(name="Type", value="Regular Video (not a Short)", inline=False)
         embed.set_footer(text="Royal Scribe | Roll With Advantage")
         
         await ctx.send(embed=embed)
@@ -1746,35 +1747,42 @@ def get_latest_youtube_video():
         
         logger.info(f"Feed entries found: {len(feed.entries)}")
         
-        if feed.entries and len(feed.entries) > 0:
-            latest_video = feed.entries[0]
-            
+        # Find the latest non-Short video
+        for entry in feed.entries:
             # Debug info
-            logger.info(f"Available attributes: {dir(latest_video)}")
+            logger.info(f"Processing video entry: {entry.title if hasattr(entry, 'title') else 'Unknown'}")
             
             # Standard YouTube ID extraction from feed entry ID 
             # Format is typically "yt:video:VIDEO_ID"
-            if hasattr(latest_video, 'id'):
-                video_id = latest_video.id.split(':')[-1]
-            else:
+            if not hasattr(entry, 'id'):
                 logger.error("No ID field in the feed entry")
-                return None
+                continue
                 
-            video_title = latest_video.title if hasattr(latest_video, 'title') else "Unknown Title"
-            video_url = latest_video.link if hasattr(latest_video, 'link') else f"https://www.youtube.com/watch?v={video_id}"
-            video_published = latest_video.published if hasattr(latest_video, 'published') else "Unknown Date"
+            video_id = entry.id.split(':')[-1]
+            video_title = entry.title if hasattr(entry, 'title') else "Unknown Title"
+            video_url = entry.link if hasattr(entry, 'link') else f"https://www.youtube.com/watch?v={video_id}"
+            video_published = entry.published if hasattr(entry, 'published') else "Unknown Date"
             
-            logger.info(f"Successfully fetched video: {video_title} ({video_id})")
+            # Check if this is a Short by examining the URL
+            is_short = False
+            if "/shorts/" in video_url:
+                is_short = True
+                logger.info(f"Detected YouTube Short: {video_title} ({video_id})")
             
-            return {
-                'id': video_id,
-                'title': video_title,
-                'url': video_url,
-                'published': video_published
-            }
-        else:
-            logger.warning("No entries found in YouTube RSS feed")
-            return None
+            # If this is a regular video (not a Short), return it
+            if not is_short:
+                logger.info(f"Found regular video: {video_title} ({video_id})")
+                return {
+                    'id': video_id,
+                    'title': video_title,
+                    'url': video_url,
+                    'published': video_published,
+                    'is_short': False
+                }
+            
+        # If we only found Shorts or no videos at all
+        logger.warning("No regular videos found in YouTube RSS feed")
+        return None
     except Exception as e:
         logger.error(f"Error fetching YouTube RSS: {e}", exc_info=True)
         return None
